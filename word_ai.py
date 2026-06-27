@@ -1,5 +1,5 @@
 """Word AI 写作助手 — 启动器.
-双击 启动.bat 即可使用。Ctrl+E 润色，Ctrl+Enter 续写启停。
+双击 启动.bat 即可使用。Ctrl+Shift+E 润色，Ctrl+Shift+Enter 续写启停。
 """
 import sys
 import os
@@ -116,6 +116,7 @@ def insert_at_cursor(text):
 # ── HTTP 客户端 ────────────────────────────────────────────
 import urllib.request
 import urllib.error
+import urllib.parse
 
 BASE_URL = "http://127.0.0.1:19800"
 
@@ -133,7 +134,9 @@ def api_post(path, data):
 def load_summary():
     try:
         doc_path = get_doc_path()
-        result = api_post("/api/summary/get", {"doc_path": doc_path or "default"})
+        url = BASE_URL + "/api/summary/get?doc_path=" + urllib.parse.quote(doc_path or "default", safe="")
+        resp = urllib.request.urlopen(url, timeout=10)
+        result = json.loads(resp.read().decode("utf-8"))
         return result.get("summary", {})
     except Exception:
         return {}
@@ -151,7 +154,7 @@ def load_style_tags():
                 return json.loads(row[0]) if row else []
             finally:
                 await db.close()
-        return asyncio.get_event_loop().run_until_complete(_get())
+        return asyncio.run(_get())
     except Exception:
         return []
 
@@ -164,7 +167,31 @@ def get_summary():
     if _cached_summary is None:
         _cached_summary = load_summary()
         _cached_style_tags = load_style_tags()
+        if not _cached_summary:
+            print("[WordAI] 提示: 尚未生成概要，按 Ctrl+Shift+G 让 AI 分析全文")
     return _cached_summary, _cached_style_tags
+
+def do_generate_summary():
+    """读取 Word 全文，调用后端生成概要。"""
+    global _cached_summary, _cached_style_tags
+    full_text = get_full_text()
+    if not full_text:
+        word_app.StatusBar = "WordAI: 未打开文档，无法生成概要"
+        return
+    word_app.StatusBar = "WordAI: 正在分析全文生成概要..."
+    print("[WordAI] 正在生成全文概要（请稍候）...")
+    try:
+        result = api_post("/api/summary/generate", {
+            "text": full_text,
+            "doc_path": get_doc_path() or "default",
+        })
+        _cached_summary = result.get("summary", {})
+        _cached_style_tags = _cached_summary.get("风格标签", [])
+        print("[WordAI] 概要已生成并存入数据库")
+        word_app.StatusBar = "WordAI: 概要生成完成"
+    except Exception as e:
+        print(f"[WordAI] 概要生成失败: {e}")
+        word_app.StatusBar = f"WordAI: 概要生成失败 - {e}"
 
 # ── 润色 ──────────────────────────────────────────────────
 def do_polish():
@@ -182,7 +209,11 @@ def do_polish():
             "summary": summary,
             "style_tags": tags,
         })
-        replace_selection(result.get("polished_text", text))
+        polished = result.get("polished_text", text)
+        # 去掉段落间的空行，只保留单个换行
+        import re
+        polished = re.sub(r'\n{2,}', '\n', polished)
+        replace_selection(polished)
     except Exception:
         pass
 
@@ -202,18 +233,40 @@ def do_continue_toggle():
             pass
         return
     # 开始
+    get_summary()  # 在主线程预加载概要，避免子线程访问 word_app
     _continue_active = True
     _continue_thread = threading.Thread(target=_do_continue_stream, daemon=True)
     _continue_thread.start()
 
 def _do_continue_stream():
     global _continue_active
-    word_app.StatusBar = "WordAI: 正在续写..."
+    import pythoncom
+    pythoncom.CoInitialize()
     try:
+        word = win32com.client.GetActiveObject("Word.Application")
+        word.StatusBar = "WordAI: 正在续写..."
         summary, tags = get_summary()
+
+        # 取上下文（线程内 COM 对象）
+        try:
+            rng = word.Selection.Range.Duplicate
+            start = rng.Start
+            rng.Start = max(0, start - 3000)
+            ctx_before = str(rng.Text).strip("\r\n")
+        except Exception:
+            ctx_before = ""
+        try:
+            rng2 = word.Selection.Range.Duplicate
+            end = rng2.End
+            rng2.End = min(rng2.Document.Content.End, end + 500)
+            rng2.Start = end
+            ctx_after = str(rng2.Text).strip("\r\n")
+        except Exception:
+            ctx_after = ""
+
         req_body = json.dumps({
-            "context_before": get_text_before(3000),
-            "context_after": get_text_after(500),
+            "context_before": ctx_before,
+            "context_after": ctx_after,
             "summary": summary,
             "style_tags": tags,
         }, ensure_ascii=False).encode("utf-8")
@@ -227,103 +280,208 @@ def _do_continue_stream():
 
         buffer = ""
         current_event = ""
+        event_lines = []
         for line_bytes in resp:
             if not _continue_active:
                 break
             line = line_bytes.decode("utf-8", errors="replace")
-            if line.startswith("event: "):
+            # SSE 事件边界：空行
+            if line in ("\n", "\r\n"):
+                if current_event == "chunk" and event_lines:
+                    # 把多行 data 拼回原始文本（保留换行符）
+                    data = "\n".join(event_lines)
+                    buffer += data
+                    # 按段落拆分输出
+                    while "\n\n" in buffer:
+                        idx = buffer.find("\n\n")
+                        paragraph = buffer[:idx].strip()
+                        buffer = buffer[idx + 2:]
+                        if paragraph:
+                            try:
+                                rng3 = word.Selection.Range
+                                rng3.Text = paragraph + "\n"
+                                rng3.Collapse(0)
+                                rng3.Select()
+                            except Exception:
+                                pass
+                event_lines = []
+                current_event = ""
+            elif line.startswith("event: "):
                 current_event = line[7:].strip()
             elif line.startswith("data: "):
-                data = line[6:].strip()
-                if current_event == "session":
-                    pass  # session_id, not needed in launcher
-                elif current_event == "chunk":
-                    buffer += data
-                    # 逐句写入
-                    while any(buffer.find(p) > 0 for p in ("。", "！", "？", "\n\n", "”", "\"")):
-                        best = 999999
-                        for punct in ("。", "！", "？", "\n\n", "”\n", "\"\n"):
-                            idx = buffer.find(punct)
-                            if 0 < idx < best:
-                                best = idx
-                        if best == 999999:
-                            break
-                        sentence = buffer[:best + 1]
-                        buffer = buffer[best + 1:]
-                        insert_at_cursor(sentence)
-                elif current_event in ("done", "cancelled"):
-                    break
-        # 写入剩余内容
+                event_lines.append(line[6:].rstrip("\r\n"))
+        # 处理最后残留
+        if current_event == "chunk" and event_lines:
+            data = "\n".join(event_lines)
+            buffer += data
+            while "\n\n" in buffer:
+                idx = buffer.find("\n\n")
+                paragraph = buffer[:idx].strip()
+                buffer = buffer[idx + 2:]
+                if paragraph:
+                    try:
+                        rng3 = word.Selection.Range
+                        rng3.Text = paragraph + "\n"
+                        rng3.Collapse(0)
+                        rng3.Select()
+                    except Exception:
+                        pass
         if buffer.strip():
-            insert_at_cursor(buffer)
+            try:
+                rng4 = word.Selection.Range
+                rng4.Text = buffer.strip() + "\n"
+                rng4.Collapse(0)
+                rng4.Select()
+            except Exception:
+                pass
     except Exception as e:
-        word_app.StatusBar = f"WordAI: 续写出错 - {e}"
+        try:
+            word.StatusBar = f"WordAI: 续写出错 - {e}"
+        except Exception:
+            pass
     finally:
         _continue_active = False
-        word_app.StatusBar = "WordAI: 续写已停止"
+        try:
+            word.StatusBar = "WordAI: 续写已停止"
+        except Exception:
+            pass
+        pythoncom.CoUninitialize()
 
 # ── 快捷键 ────────────────────────────────────────────────
 import tkinter as tk
-from ctypes import wintypes, windll, byref, WINFUNCTYPE
+import queue
+import ctypes
+from ctypes import wintypes, windll, byref, WINFUNCTYPE, sizeof, c_uint, c_int
 
-# RegisterHotKey via ctypes
 user32 = windll.user32
+kernel32 = windll.kernel32
+
 HOTKEY_POLISH = 1
 HOTKEY_CONTINUE = 2
+HOTKEY_SUMMARY = 3
 MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
 WM_HOTKEY = 0x0312
+HWND_MESSAGE = -3
+
+VK_E = 0x45
+VK_RETURN = 0x0D
+VK_G = 0x47
 
 WNDPROC = WINFUNCTYPE(wintypes.LPARAM, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
+# 动作队列：热键子线程 → 主线程安全转发
+_action_queue = queue.Queue()
+
+class WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", c_uint),
+        ("style", c_uint),
+        ("lpfnWndProc", WNDPROC),
+        ("cbClsExtra", c_int),
+        ("cbWndExtra", c_int),
+        ("hInstance", wintypes.HINSTANCE),
+        ("hIcon", wintypes.HANDLE),
+        ("hCursor", wintypes.HANDLE),
+        ("hbrBackground", wintypes.HANDLE),
+        ("lpszMenuName", ctypes.c_wchar_p),
+        ("lpszClassName", ctypes.c_wchar_p),
+        ("hIconSm", wintypes.HANDLE),
+    ]
+
+user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.DefWindowProcW.restype = wintypes.LPARAM
+user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+user32.GetMessageW.restype = wintypes.BOOL
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.DispatchMessageW.restype = wintypes.LPARAM
+user32.RegisterHotKey.argtypes = [wintypes.HWND, c_int, wintypes.UINT, wintypes.UINT]
+user32.RegisterHotKey.restype = wintypes.BOOL
+user32.UnregisterHotKey.argtypes = [wintypes.HWND, c_int]
+user32.UnregisterHotKey.restype = wintypes.BOOL
+
+@WNDPROC
+def _hotkey_wndproc(hwnd_, msg, wparam, lparam):
+    if msg == WM_HOTKEY:
+        _action_queue.put(int(wparam))
+        return 0
+    return user32.DefWindowProcW(hwnd_, msg, wparam, lparam)
+
+# 注册消息窗口类
+wc = WNDCLASSEXW()
+wc.cbSize = sizeof(WNDCLASSEXW)
+wc.lpfnWndProc = _hotkey_wndproc
+wc.hInstance = kernel32.GetModuleHandleW(None)
+wc.lpszClassName = "WordAIHotkeyCls"
+if not user32.RegisterClassExW(byref(wc)):
+    print("[WordAI] 错误: 注册热键窗口类失败")
+
+# 创建独立的消息窗口（HWND_MESSAGE，与 tkinter 完全隔离）
+_hotkey_hwnd = user32.CreateWindowExW(0, "WordAIHotkeyCls", "", 0,
+                                       0, 0, 0, 0,
+                                       wintypes.HWND(HWND_MESSAGE),
+                                       None, wc.hInstance, None)
+if not _hotkey_hwnd:
+    print("[WordAI] 错误: 创建热键消息窗口失败")
+else:
+    if not user32.RegisterHotKey(_hotkey_hwnd, HOTKEY_POLISH, MOD_CONTROL | MOD_SHIFT, VK_E):
+        print("[WordAI] 警告: Ctrl+Shift+E 注册失败（可能被其他程序占用）")
+    if not user32.RegisterHotKey(_hotkey_hwnd, HOTKEY_CONTINUE, MOD_CONTROL | MOD_SHIFT, VK_RETURN):
+        print("[WordAI] 警告: Ctrl+Shift+Enter 注册失败")
+    if not user32.RegisterHotKey(_hotkey_hwnd, HOTKEY_SUMMARY, MOD_CONTROL | MOD_SHIFT, VK_G):
+        print("[WordAI] 警告: Ctrl+Shift+G 注册失败（可能被其他程序占用）")
+
+# 后台线程：独占消息窗口的消息泵
+def _hotkey_pump():
+    msg = wintypes.MSG()
+    while user32.GetMessageW(byref(msg), _hotkey_hwnd, 0, 0):
+        user32.TranslateMessage(byref(msg))
+        user32.DispatchMessageW(byref(msg))
+
+_pump_thread = threading.Thread(target=_hotkey_pump, daemon=True)
+_pump_thread.start()
+
+# tkinter 根窗口（仅用于 after 回调调到主线程）
 root = tk.Tk()
 root.withdraw()
-
-# 获取 tkinter 窗口的 HWND
-hwnd = int(root.winfo_id())
-
-if not user32.RegisterHotKey(wintypes.HWND(hwnd), HOTKEY_POLISH, MOD_CONTROL, ord('E')):
-    print("[WordAI] 警告: Ctrl+E 注册失败（可能被其他程序占用）")
-if not user32.RegisterHotKey(wintypes.HWND(hwnd), HOTKEY_CONTINUE, MOD_CONTROL, wintypes.VK_RETURN):
-    print("[WordAI] 警告: Ctrl+Enter 注册失败")
-
-# 保存原始窗口过程，安装子类化回调
-# 使用 SetWindowLong 子类化
-GWL_WNDPROC = -4
-old_wndproc = user32.SetWindowLongW(wintypes.HWND(hwnd), GWL_WNDPROC, 0)
-# 需要用实际函数指针，比较复杂。改用轮询方式：
-
-def poll_hotkeys():
-    """轮询 WM_HOTKEY 消息。"""
-    msg = wintypes.MSG()
-    while user32.PeekMessageW(byref(msg), wintypes.HWND(hwnd), WM_HOTKEY, WM_HOTKEY, 1):  # PM_REMOVE
-        if msg.message == WM_HOTKEY:
-            if msg.wParam == HOTKEY_POLISH:
-                threading.Thread(target=do_polish, daemon=True).start()
-            elif msg.wParam == HOTKEY_CONTINUE:
-                threading.Thread(target=do_continue_toggle, daemon=True).start()
-    root.after(100, poll_hotkeys)
-
-root.after(500, poll_hotkeys)
-
-# 设置窗口标题（方便查找）
 root.title("WordAI")
+
+# 主线程轮询动作队列，执行 COM 操作
+def _process_actions():
+    try:
+        while True:
+            action_id = _action_queue.get_nowait()
+            if action_id == HOTKEY_POLISH:
+                do_polish()
+            elif action_id == HOTKEY_CONTINUE:
+                do_continue_toggle()
+            elif action_id == HOTKEY_SUMMARY:
+                do_generate_summary()
+    except queue.Empty:
+        pass
+    root.after(100, _process_actions)
+
+root.after(500, _process_actions)
 
 # ── 清理 ──────────────────────────────────────────────────
 def on_close():
-    user32.UnregisterHotKey(wintypes.HWND(hwnd), HOTKEY_POLISH)
-    user32.UnregisterHotKey(wintypes.HWND(hwnd), HOTKEY_CONTINUE)
+    if _hotkey_hwnd:
+        user32.UnregisterHotKey(_hotkey_hwnd, HOTKEY_POLISH)
+        user32.UnregisterHotKey(_hotkey_hwnd, HOTKEY_CONTINUE)
+        user32.UnregisterHotKey(_hotkey_hwnd, HOTKEY_SUMMARY)
+        user32.DestroyWindow(_hotkey_hwnd)
     backend_proc.terminate()
     backend_proc.wait(timeout=5)
     root.destroy()
 
 root.protocol("WM_DELETE_WINDOW", on_close)
 
-print("[WordAI] 就绪 — Ctrl+E 润色 / Ctrl+Enter 续写")
+print("[WordAI] 就绪 — Ctrl+Shift+E 润色 / Ctrl+Shift+Enter 续写 / Ctrl+Shift+G 生成概要")
 print("[WordAI] 关闭此窗口退出")
 
 # 在 Word 状态栏显示就绪
 try:
-    word_app.StatusBar = "WordAI: 就绪 (Ctrl+E 润色 / Ctrl+Enter 续写)"
+    word_app.StatusBar = "WordAI: 就绪 (Ctrl+Shift+E 润色 / Ctrl+Shift+Enter 续写 / Ctrl+Shift+G 概要)"
 except Exception:
     pass
 

@@ -5,3 +5,4 @@ venv/
 *.pyo
 config/
 .ai-writing/
+docs/

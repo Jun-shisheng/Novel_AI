@@ -14,6 +14,7 @@ def build_polish_prompt(text: str, context_before: str, context_after: str, summ
         "3. 不改变情节走向，不添加新事件\n"
         "4. 不改变人称和视角\n"
         "5. 直接输出润色后的文本，不要加任何解释或标记\n"
+        "6. 段落之间不要增加空行，保持原文的段落间距格式\n"
         f"风格参考：{style_str}"
     ).format(expand=30)
 
@@ -41,7 +42,8 @@ def build_continue_prompt(context_before: str, context_after: str, summary: dict
         "2. 推进情节合理发展，与全局概要保持一致\n"
         "3. 保持对话风格、节奏感与原文一致\n"
         "4. 不要重复已有内容，从光标处自然延续\n"
-        "5. 直接输出续写文本，不要加解释\n"
+        "5. 合理分段，段落之间用一个空行分隔（即两个换行符）\n"
+        "6. 直接输出续写文本，不要加解释\n"
         f"风格：{style_str}"
     )
 

@@ -8,7 +8,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
 
-CONFIG_DIR = Path("G:/WordAI/config")
+CONFIG_DIR = Path(__file__).parent.parent / "config"
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 KEY_FILE = CONFIG_DIR / ".key"
 
@@ -27,7 +27,7 @@ DEFAULT_CONFIG = {
 
 # NOTE: This provides obfuscation, not cryptographic security.
 # The key is derived from hostname (low entropy). An attacker with
-# filesystem access to G:/WordAI/config/ can recover the API key.
+# filesystem access to the config directory can recover the API key.
 # For the localhost-only threat model, this is acceptable.
 def _derive_key() -> bytes:
     """基于机器标识派生加密密钥。"""

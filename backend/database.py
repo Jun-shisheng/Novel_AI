@@ -2,7 +2,7 @@
 import aiosqlite
 from pathlib import Path
 
-DB_DIR = Path("G:/WordAI/.ai-writing")
+DB_DIR = Path(__file__).parent.parent / ".ai-writing"
 DB_DIR.mkdir(parents=True, exist_ok=True)
 
 
