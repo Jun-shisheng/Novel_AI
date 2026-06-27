@@ -35,6 +35,12 @@ backend\venv\Scripts\pip install pywin32
 
 **首次使用**先按 `Ctrl+Shift+G` 让 AI 分析全文生成概要，之后润色和续写就会关联完整上下文。
 
+## API Key
+
+本项目不包含任何 API 密钥。首次运行时会自动提示输入。
+
+获取 DeepSeek API Key：[platform.deepseek.com](https://platform.deepseek.com) → API Keys → 创建，复制后填入即可。密钥加密存储在本地 `config/settings.json`，不上传 GitHub。
+
 ## 配置
 
 首次运行在 Word 状态栏提示输入 API Key，加密存储在 `config/settings.json`。也可直接编辑该文件（首次启动后自动生成）。
