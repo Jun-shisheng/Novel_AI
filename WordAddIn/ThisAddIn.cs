@@ -26,6 +26,15 @@ namespace WordAI
             _backendClient = new BackendClient("http://127.0.0.1:19800");
             _contextExtractor = new ContextExtractor(this.Application);
             _textWriter = new TextWriter(this.Application);
+            // 注入上下文提取钩子
+            _backendClient.ContextBefore = _contextExtractor.GetTextBefore;
+            _backendClient.ContextAfter = _contextExtractor.GetTextAfter;
+            // 加载已有概要
+            string docPath = _contextExtractor.GetDocPath();
+            if (!string.IsNullOrEmpty(docPath))
+            {
+                _ = _backendClient.LoadSummaryAsync(docPath);
+            }
             _hotkeyManager = new HotkeyManager(this);
             _hotkeyManager.Register();
         }
@@ -68,8 +77,5 @@ namespace WordAI
                 _pythonProcess.Dispose();
             }
         }
-
-        private void InternalStartup() => this.Startup += ThisAddIn_Startup;
-        private void InternalShutdown() => this.Shutdown += ThisAddIn_Shutdown;
     }
 }
