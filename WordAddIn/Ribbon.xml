@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<customUI xmlns="http://schemas.microsoft.com/office/2009/07/customui"
+          onLoad="Ribbon_Load">
+  <ribbon>
+    <tabs>
+      <tab id="tabWordAI" label="AI 写作">
+        <group id="grpPolish" label="润色">
+          <button id="btnPolish" label="润色/扩写"
+                  size="large" imageMso="ReviewAcceptChange"
+                  onAction="OnPolishClick"
+                  screentip="润色扩写选中文本"
+                  supertip="选中段落后点击，AI 自动润色并扩写。快捷键: Ctrl+E" />
+        </group>
+        <group id="grpContinue" label="续写">
+          <button id="btnContinue" label="续写"
+                  size="large" imageMso="CreateReport"
+                  onAction="OnContinueToggle"
+                  screentip="开始/停止续写"
+                  supertip="从光标处开始续写，再次点击停止。快捷键: Ctrl+Enter" />
+          <labelControl id="lblStatus" />
+        </group>
+        <group id="grpSummary" label="概要">
+          <button id="btnGenSummary" label="生成概要"
+                  size="large" imageMso="CreateQuery"
+                  onAction="OnGenerateSummary"
+                  screentip="选中全文后生成结构化概要" />
+          <button id="btnUpdateSummary" label="更新概要"
+                  size="normal" imageMso="Sync"
+                  onAction="OnUpdateSummary"
+                  screentip="选中新增文本后增量更新概要" />
+        </group>
+        <group id="grpSettings" label="设置">
+          <button id="btnSettings" label="设置"
+                  size="large" imageMso="Settings"
+                  onAction="OnSettings" />
+        </group>
+      </tab>
+    </tabs>
+  </ribbon>
+</customUI>
