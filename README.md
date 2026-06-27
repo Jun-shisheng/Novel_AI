@@ -1,73 +1,36 @@
 # Word AI 写作助手
 
-Windows Word 2019 桌面版 AI 写作插件，集成 DeepSeek API 实现润色扩写、流式续写和结构化概要生成。
+Windows Word 2019 桌面版 AI 写作插件，集成 DeepSeek API 实现润色扩写和流式续写。
 
-## 功能
-
-- **润色/扩写** (Ctrl+E): 选中文本，一键扩写润色，直接替换原文
-- **流式续写** (Ctrl+Enter): 从光标处续写，逐句实时写入，再按停止
-- **概要系统**: 自动提取人物、情节、伏笔、风格标签，注入每次请求
-- **增量更新**: 新章节增量更新概要，无需重读全文
-
-## 系统要求
-
-- Windows 10/11
-- Microsoft Word 2019 桌面版
-- .NET Framework 4.8
-- Python 3.11+
-
-## 安装
-
-### 1. Python 后端
-
-```bash
-cd backend
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-### 2. VSTO 加载项
-
-1. 用 Visual Studio 2022 打开 `WordAddIn\WordAddIn.csproj`
-2. 构建 → 生成 WordAddIn
-3. 运行项目启动 Word 调试，或发布为 ClickOnce 安装包
-
-### 3. 配置
-
-1. 启动 Word，点击 "AI 写作" → "设置"
-2. 填入 DeepSeek API Key（从 https://platform.deepseek.com 获取）
-3. 调整上下文长度和润色参数
-
-## 开发
-
-```bash
-# 启动后端
-cd backend && venv\Scripts\python main.py
-
-# 构建 VSTO
-msbuild WordAddIn\WordAddIn.csproj /t:Build
-```
-
-## 项目结构
+## 使用
 
 ```
-WordAI/
-├── backend/          # Python FastAPI 后台
-│   ├── main.py       # API 入口
-│   ├── config.py     # 配置加密
-│   ├── deepseek_client.py  # DeepSeek 客户端
-│   ├── prompt_builder.py   # Prompt 构建
-│   ├── summary_manager.py  # 概要管理
-│   └── database.py   # SQLite
-├── WordAddIn/        # VSTO C# 加载项
-│   ├── ThisAddIn.cs  # 入口与生命周期
-│   ├── HotkeyManager.cs    # 快捷键
-│   ├── ContextExtractor.cs # 文本提取
-│   ├── TextWriter.cs       # 文本写入
-│   ├── BackendClient.cs    # HTTP 客户端
-│   └── SettingsForm.cs     # 设置窗口
-└── docs/             # 设计文档
+双击「启动.bat」→ 切换到 Word → 开始写
 ```
 
-Commit: `docs: add README with installation and usage guide`
+| 快捷键 | 功能 |
+|--------|------|
+| **Ctrl+E** | 选中段落后润色扩写，直接替换原文 |
+| **Ctrl+Enter** | 光标处开始续写 / 再次按停止 |
+
+## 一键安装
+
+1. 确保已安装 **Python 3.11+**（python.org 下载）
+2. 双击 `安装.bat`，等待完成
+3. 把 `启动.bat` 创建桌面快捷方式，方便每天使用
+
+## 配置
+
+API Key 已预置。如需修改，编辑 `config/settings.json`（首次运行后生成）。
+
+## 目录结构
+
+```
+G:\WordAI\
+├── word_ai.py          # 主启动器（快捷键 + Word 集成）
+├── 安装.bat            # 一次性安装脚本
+├── 启动.bat            # 日常使用入口
+├── backend/            # Python 后台服务
+├── config/             # 配置文件（G 盘）
+└── .ai-writing/        # 概要数据库（G 盘）
+```
