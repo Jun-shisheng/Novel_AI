@@ -1,13 +1,12 @@
 """请求/响应数据模型."""
 from pydantic import BaseModel, Field
-from typing import Optional
 
 
 class PolishRequest(BaseModel):
     text: str = Field(..., description="选中文本")
     context_before: str = Field("", description="前文")
     context_after: str = Field("", description="后文")
-    summary: dict = Field(default_factory=dict, description="全局概要")
+    summary: dict[str, object] = Field(default_factory=dict, description="全局概要")
     style_tags: list[str] = Field(default_factory=list)
 
 
@@ -18,7 +17,7 @@ class PolishResponse(BaseModel):
 class ContinueRequest(BaseModel):
     context_before: str = Field(..., description="光标前文")
     context_after: str = Field("", description="光标后文")
-    summary: dict = Field(default_factory=dict)
+    summary: dict[str, object] = Field(default_factory=dict)
     style_tags: list[str] = Field(default_factory=list)
 
 
@@ -33,15 +32,15 @@ class SummaryUpdateRequest(BaseModel):
 
 
 class SummaryResponse(BaseModel):
-    summary: dict
+    summary: dict[str, object]
 
 
 class SettingsResponse(BaseModel):
-    config: dict
+    config: dict[str, object]
 
 
 class SettingsUpdateRequest(BaseModel):
-    config: dict
+    config: dict[str, object]
 
 
 class CancelResponse(BaseModel):
