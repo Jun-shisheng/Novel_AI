@@ -22,6 +22,11 @@ DEFAULT_CONFIG = {
     "polish_after_chars": 200,
     "polish_expand_ratio": 1.3,
     "setting_file_path": "",
+    # 保存文档后，若新增内容超过阈值，自动增量更新概要（0 表示关闭）
+    "auto_summary_update": True,
+    "auto_summary_threshold": 1200,
+    # 两次自动更新之间的最小间隔（秒）
+    "auto_summary_min_interval": 60,
 }
 
 
