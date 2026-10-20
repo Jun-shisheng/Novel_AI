@@ -9,6 +9,7 @@ class PolishRequest(BaseModel):
     summary: dict[str, object] = Field(default_factory=dict, description="全局概要")
     style_tags: list[str] = Field(default_factory=list)
     avoid_text: str = Field("", description="上一次生成的内容，避免重复")
+    doc_path: str = Field("", description="文档路径，用于加载故事记忆")
 
 
 class PolishResponse(BaseModel):
@@ -23,6 +24,7 @@ class RewriteRequest(BaseModel):
     summary: dict[str, object] = Field(default_factory=dict)
     style_tags: list[str] = Field(default_factory=list)
     avoid_text: str = Field("", description="上一次生成的内容，避免重复")
+    doc_path: str = Field("", description="文档路径，用于加载故事记忆")
 
 
 class ContinueRequest(BaseModel):
@@ -32,6 +34,7 @@ class ContinueRequest(BaseModel):
     style_tags: list[str] = Field(default_factory=list)
     target_length: int = Field(0, ge=0, le=20000, description="目标字数，0 表示不限")
     avoid_text: str = Field("", description="上一次生成的内容，避免重复")
+    doc_path: str = Field("", description="文档路径，用于加载故事记忆")
 
 
 class OutlineRequest(BaseModel):
@@ -72,6 +75,27 @@ class SummaryImportRequest(BaseModel):
     doc_path: str = Field(..., description="关联的文档路径")
     summary: dict[str, object]
     summarized_end: int = Field(0, ge=0)
+    story_state: dict[str, object] = Field(default_factory=dict)
+    chapters: list[dict[str, object]] = Field(default_factory=list)
+
+
+class MemoryIndexRequest(BaseModel):
+    doc_path: str = Field(..., description="关联的文档路径")
+    text: str = Field(..., description="用于重建检索索引的全文")
+
+
+class ConsistencyCheckRequest(BaseModel):
+    text: str = Field(..., description="待检查的生成文本")
+    context_before: str = Field("")
+    context_after: str = Field("")
+    doc_path: str = Field("")
+    action: str = Field("", description="润色/改写/续写")
+
+
+class ConsistencyFixRequest(BaseModel):
+    text: str = Field(..., description="待修正文本")
+    issues: list[dict[str, object]] = Field(default_factory=list)
+    doc_path: str = Field("")
 
 
 class SummaryDeleteRequest(BaseModel):

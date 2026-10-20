@@ -21,6 +21,8 @@ echo 已启动！切换到 Word 即可使用：
 echo   Ctrl+Shift+E      润色选中文本
 echo   Ctrl+Shift+Enter  续写 / 停止
 echo   Ctrl+Shift+G      生成全文概要
+echo   Ctrl+Alt+N        故事记忆（状态/章节/检索索引）
+echo   Ctrl+Alt+V        查看连贯性检查结果
 echo   Ctrl+Alt+H        查看全部快捷键
 echo   Ctrl+Alt+Q        退出 WordAI
 echo.

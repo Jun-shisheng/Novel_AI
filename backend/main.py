@@ -1,5 +1,6 @@
 """Word AI 写作助手 — Python 后台入口."""
 import asyncio
+import logging
 import uuid
 
 import httpx
@@ -17,6 +18,7 @@ from models import (
     SummaryGenerateRequest, SummaryUpdateRequest, SummarySaveRequest,
     SummaryImportRequest, SummaryDeleteRequest, SummaryResponse, SummaryListResponse,
     StyleTagsResponse, DocStateResponse,
+    MemoryIndexRequest, ConsistencyCheckRequest, ConsistencyFixRequest,
     SettingsResponse, SettingsUpdateRequest,
     CancelResponse,
 )
@@ -26,7 +28,9 @@ from summary_manager import (
     get_summary, get_style_tags, get_doc_state,
     generate_summary, update_summary, save_summary, import_summary,
     delete_summary, list_summaries, generate_outline, generate_character_cards,
+    check_consistency, fix_consistency,
 )
+import memory_manager
 from cancel_manager import cancel_manager
 from version import __version__
 
@@ -77,6 +81,28 @@ async def _run_ai(coro):
         raise HTTPException(status_code=500, detail=f"AI 请求失败：{exc}") from exc
 
 
+async def _load_memory(
+    doc_path: str,
+    query: str,
+    exclude_text: str = "",
+    top_k: int | None = None,
+) -> dict:
+    cfg = load_config()
+    if not doc_path or not cfg.get("memory_enabled", True):
+        return {}
+    try:
+        return await memory_manager.get_memory(
+            doc_path,
+            query=query,
+            exclude_text=exclude_text,
+            top_k=top_k if top_k is not None else int(cfg.get("memory_retrieve_top_k", 4)),
+            recent_chapters=int(cfg.get("memory_recent_chapters", 3)),
+        )
+    except Exception:
+        logging.getLogger("main").exception("加载故事记忆失败")
+        return {}
+
+
 @app.get("/api/health")
 async def health():
     return {"status": "ok", "version": __version__}
@@ -85,11 +111,17 @@ async def health():
 @app.post("/api/polish", response_model=PolishResponse)
 async def polish(req: PolishRequest):
     cfg = load_config()
+    memory = await _load_memory(
+        req.doc_path,
+        query=req.context_before[-1200:] + "\n" + req.text + "\n" + req.context_after[:400],
+        exclude_text=req.text,
+    )
     messages = build_polish_prompt(
         req.text, req.context_before, req.context_after,
         req.summary, req.style_tags,
         expand_ratio=cfg.get("polish_expand_ratio", 1.3),
         avoid_text=req.avoid_text,
+        memory=memory,
     )
     result = await _run_ai(chat_completion(messages, temperature=0.9, max_tokens=4096))
     return PolishResponse(polished_text=result)
@@ -97,10 +129,16 @@ async def polish(req: PolishRequest):
 
 @app.post("/api/rewrite", response_model=PolishResponse)
 async def rewrite(req: RewriteRequest):
+    memory = await _load_memory(
+        req.doc_path,
+        query=req.context_before[-1200:] + "\n" + req.text + "\n" + req.context_after[:400],
+        exclude_text=req.text,
+    )
     messages = build_rewrite_prompt(
         req.text, req.context_before, req.context_after,
         req.summary, req.style_tags, req.style,
         avoid_text=req.avoid_text,
+        memory=memory,
     )
     result = await _run_ai(chat_completion(messages, temperature=0.9, max_tokens=4096))
     return PolishResponse(polished_text=result)
@@ -110,9 +148,16 @@ async def rewrite(req: RewriteRequest):
 async def continue_write(req: ContinueRequest):
     session_id = uuid.uuid4().hex[:8]
     cancel_event = cancel_manager.create(session_id)
+    memory = await _load_memory(
+        req.doc_path,
+        query=req.context_before[-1800:] + "\n" + req.context_after[:500],
+        # 已经在上下文里的近期原文不再重复注入，检索更早的相关段落
+        exclude_text=req.context_before[-3000:] + "\n" + req.context_after[:500],
+    )
     messages = build_continue_prompt(
         req.context_before, req.context_after,
         req.summary, req.style_tags, req.target_length, req.avoid_text,
+        memory=memory,
     )
 
     async def event_generator():
@@ -158,6 +203,37 @@ async def character_cards(req: CharacterCardsRequest):
     return SummaryResponse(summary=cards)
 
 
+@app.get("/api/memory/get")
+async def memory_get(doc_path: str = ""):
+    return await memory_manager.get_memory_raw(doc_path or "default")
+
+
+@app.post("/api/memory/index")
+async def memory_index(req: MemoryIndexRequest):
+    count = await memory_manager.rebuild_index(req.doc_path or "default", req.text)
+    return {"chunks": count}
+
+
+@app.post("/api/consistency/check")
+async def consistency_check(req: ConsistencyCheckRequest):
+    summary = await get_summary(req.doc_path or "default") if req.doc_path else {}
+    return await _run_ai(
+        check_consistency(
+            req.text, req.context_before, req.context_after,
+            summary or {}, req.doc_path, req.action,
+        )
+    )
+
+
+@app.post("/api/consistency/fix")
+async def consistency_fix(req: ConsistencyFixRequest):
+    summary = await get_summary(req.doc_path or "default") if req.doc_path else {}
+    fixed = await _run_ai(
+        fix_consistency(req.text, req.issues, summary or {}, req.doc_path)
+    )
+    return {"fixed_text": fixed}
+
+
 @app.post("/api/summary/generate", response_model=SummaryResponse)
 async def summary_generate(req: SummaryGenerateRequest):
     summary = await _run_ai(generate_summary(req.text, req.doc_path or "default", req.doc_end))
@@ -198,7 +274,13 @@ async def summary_save(req: SummarySaveRequest):
 @app.post("/api/summary/import", response_model=SummaryResponse)
 async def summary_import(req: SummaryImportRequest):
     summary = await _run_ai(
-        import_summary(req.doc_path or "default", req.summary, req.summarized_end)
+        import_summary(
+            req.doc_path or "default",
+            req.summary,
+            req.summarized_end,
+            req.story_state,
+            req.chapters,
+        )
     )
     return SummaryResponse(summary=summary)
 

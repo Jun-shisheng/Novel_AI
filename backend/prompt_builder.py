@@ -33,6 +33,51 @@ def _append_avoid_section(user: str, avoid_text: str) -> str:
     )
 
 
+def _memory_section(memory: dict | None) -> str:
+    """把章节记忆、当前状态、检索到的相关前文拼成提示词区块。"""
+    if not memory:
+        return ""
+    parts: list[str] = []
+
+    state = memory.get("story_state")
+    if isinstance(state, dict) and state:
+        # 全局概要里已有主角/人物/伏笔，这里只注入写作时最需要盯住的状态，控制 token
+        keys = ("时间", "地点", "在场人物", "关键物品", "未解决线索", "关系变化", "主角", "主线")
+        state_view = {key: state[key] for key in keys if key in state} or state
+        encoded = json.dumps(state_view, ensure_ascii=False, indent=2)[:3000]
+        parts.append("## 当前故事状态（事实约束，写作时必须保持一致）\n" + encoded)
+
+    chapters = memory.get("recent_chapters") or []
+    lines = []
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            continue
+        index = chapter.get("chapter_index", "?")
+        title = chapter.get("title") or f"第{index}段"
+        summary = str(chapter.get("summary") or "").strip()
+        if summary:
+            lines.append(f"- {title}（第{index}段）：{summary}")
+    if lines:
+        parts.append("## 近期章节记忆\n" + "\n".join(lines))
+
+    retrieved = memory.get("retrieved") or []
+    texts = []
+    for item in retrieved:
+        text = item.get("text") if isinstance(item, dict) else str(item)
+        text = str(text or "").strip()
+        if text:
+            texts.append(text[:1500])
+    if texts:
+        parts.append(
+            "## 相关前文（本地检索，仅供事实参考；与当前正文冲突时以当前正文为准）\n"
+            + "\n\n---\n\n".join(texts)
+        )
+
+    if not parts:
+        return ""
+    return "\n\n".join(parts) + "\n"
+
+
 def _summary_json(summary: dict) -> str:
     return json.dumps(summary, ensure_ascii=False, indent=2) if summary else "（暂无概要）"
 
@@ -49,6 +94,7 @@ def build_polish_prompt(
     style_tags: list[str],
     expand_ratio: float = 1.3,
     avoid_text: str = "",
+    memory: dict | None = None,
 ) -> list[dict]:
     try:
         percent = round((float(expand_ratio) - 1) * 100)
@@ -76,6 +122,9 @@ def build_polish_prompt(
         f"## 后文（保持连贯）\n{context_after}\n\n"
         f"## 作品概要\n{_summary_json(summary)}\n"
     )
+    memory_text = _memory_section(memory)
+    if memory_text:
+        user += "\n" + memory_text
     user = _append_avoid_section(user, avoid_text)
     user += "\n请输出润色扩写后的完整段落，直接替换原文："
     return [
@@ -92,6 +141,7 @@ def build_rewrite_prompt(
     style_tags: list[str],
     style: str,
     avoid_text: str = "",
+    memory: dict | None = None,
 ) -> list[dict]:
     system = (
         "你是一位专业的小说编辑，擅长按照指定风格改写文字。\n"
@@ -112,6 +162,9 @@ def build_rewrite_prompt(
         f"## 后文（保持连贯）\n{context_after}\n\n"
         f"## 作品概要\n{_summary_json(summary)}\n"
     )
+    memory_text = _memory_section(memory)
+    if memory_text:
+        user += "\n" + memory_text
     user = _append_avoid_section(user, avoid_text)
     user += "\n请输出改写后的完整段落，直接替换原文："
     return [
@@ -127,6 +180,7 @@ def build_continue_prompt(
     style_tags: list[str],
     target_length: int = 0,
     avoid_text: str = "",
+    memory: dict | None = None,
 ) -> list[dict]:
     system = (
         "你是一位专业的小说作家，擅长根据上下文无缝续写。\n"
@@ -149,8 +203,69 @@ def build_continue_prompt(
         f"## 后文（光标之后的内容，避免矛盾）\n{context_after}\n\n"
         f"## 作品概要\n{_summary_json(summary)}\n"
     )
+    memory_text = _memory_section(memory)
+    if memory_text:
+        user += "\n" + memory_text
     user = _append_avoid_section(user, avoid_text)
     user += "\n请从光标位置自然续写："
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def build_consistency_check_prompt(
+    text: str,
+    context_before: str,
+    context_after: str,
+    summary: dict,
+    memory: dict | None,
+) -> list[dict]:
+    system = (
+        "你是一位严格的小说连贯性审校。你的任务是根据故事状态、章节记忆、相关前文，"
+        "检查待检查文本中是否存在明确的事实矛盾或连贯性问题。\n"
+        "只报告有证据的明确矛盾，不做文风评价，不臆测。\n"
+        "问题类型包括：人物状态（死亡/受伤/身份）、时间、地点、关键物品、人物关系、"
+        "世界观设定、情节因果、前后重复。\n"
+        "输出 JSON：\n"
+        '{"ok": true, "issues": [{"type": "", "detail": "", "evidence": ""}], "suggestion": ""}\n'
+        "没有发现明确矛盾时 ok 为 true、issues 为空数组。只输出 JSON。"
+    )
+    user = (
+        f"## 前文\n{context_before}\n\n"
+        f"## 待检查文本\n{text}\n\n"
+        f"## 后文\n{context_after}\n\n"
+        f"## 作品概要\n{_summary_json(summary)}\n"
+    )
+    memory_text = _memory_section(memory)
+    if memory_text:
+        user += "\n" + memory_text
+    user += "\n请检查并输出 JSON："
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def build_consistency_fix_prompt(
+    text: str,
+    issues: list,
+    summary: dict,
+    memory: dict | None,
+) -> list[dict]:
+    system = (
+        "你是一位小说编辑。请只修正下面列出的连贯性问题，"
+        "保持原文的情节、风格、人称、段落结构和大致长度，不新增事件。"
+        "直接输出修改后的完整文本，不要解释或标记。"
+    )
+    user = (
+        f"## 需要修正的问题\n{json.dumps(issues, ensure_ascii=False, indent=2)}\n\n"
+        f"## 作品概要\n{_summary_json(summary)}\n"
+    )
+    memory_text = _memory_section(memory)
+    if memory_text:
+        user += "\n" + memory_text
+    user += f"\n## 待修正文本\n{text}\n\n请输出修正后的完整文本："
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -164,7 +279,10 @@ def build_summary_chunk_prompt(chunk_text: str, is_first: bool) -> list[dict]:
             "请从以下小说片段中提取结构化信息，以 JSON 格式输出：\n\n"
             f"{chunk_text}\n\n"
             "输出格式：\n"
-            '{"主角": {"姓名": "", "梗概": "", "当前状态": "", "目标": "", "冲突": "", "后续发展": ""}, '
+            '{"本段概要": "100-200字，概括本段发生了什么", '
+            '"本段结束状态": {"时间": "", "地点": "", "在场人物": [], "关键物品": [], '
+            '"未解决线索": [], "关系变化": []}, '
+            '"主角": {"姓名": "", "梗概": "", "当前状态": "", "目标": "", "冲突": "", "后续发展": ""}, '
             '"情节线": "", '
             '"人物": [{"姓名": "", "角色": "", "人物梗概": "", "与其他人物关系": "", "后续发展": ""}], '
             '"角色关系": [{"角色A": "", "角色B": "", "关系": "", "发展": ""}], '
@@ -174,7 +292,9 @@ def build_summary_chunk_prompt(chunk_text: str, is_first: bool) -> list[dict]:
         )
     else:
         user = (
-            "以下是追加的小说片段，请提取新增信息，以相同 JSON 格式输出（只输出新增/更新部分，不要输出解释）：\n\n"
+            "以下是追加的小说片段。请以相同 JSON 格式提取信息，"
+            "必须包含本段概要、本段结束状态，以及新增/更新的人物、关系、伏笔、世界观等。"
+            "只输出 JSON，不要解释：\n\n"
             f"{chunk_text}"
         )
     return [

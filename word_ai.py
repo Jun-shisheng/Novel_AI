@@ -97,6 +97,7 @@ _stream_queue: queue.Queue = queue.Queue()
 
 _last_ai_op: dict | None = None
 _undo_open = False
+_last_consistency: dict | None = None
 
 # 记录同一段文字最近一次 AI 输出，重试时要求换一种写法
 _VARIATION_HISTORY: dict[str, str] = {}
@@ -190,6 +191,57 @@ def _report_error(exc) -> None:
         _status("API Key 无效或未配置，请按 Ctrl+Alt+K 设置")
     else:
         _status(f"失败：{message[:120]}")
+
+
+def _maybe_check_consistency(
+    text: str,
+    doc_path: str,
+    context_before: str,
+    context_after: str,
+    action: str,
+    start: int,
+    end: int,
+) -> None:
+    """生成后异步自检；有问题时只提示，不弹窗。"""
+    if not bool(_settings.get("consistency_check", True)):
+        return
+    text = _canon(text)
+    if len(text) < 80:
+        return
+
+    payload = {
+        "text": text,
+        "context_before": context_before,
+        "context_after": context_after,
+        "doc_path": doc_path,
+        "action": action,
+    }
+
+    def ok(result):
+        global _last_consistency
+        issues = (result or {}).get("issues") or []
+        if not isinstance(issues, list) or not issues:
+            log.info("连贯性检查通过（%s）", action)
+            return
+        _last_consistency = {
+            "issues": issues,
+            "suggestion": str((result or {}).get("suggestion") or ""),
+            "text": text,
+            "doc_path": doc_path,
+            "start": int(start),
+            "end": int(end),
+            "action": action,
+        }
+        _status(f"连贯性检查发现 {len(issues)} 处可能矛盾，按 Ctrl+Alt+V 查看")
+
+    def err(exc):
+        log.warning("连贯性检查失败: %s", _describe_error(exc))
+
+    submit_job(
+        lambda: api_post("/api/consistency/check", payload, timeout=300),
+        ok,
+        err,
+    )
 
 
 # ── HTTP 客户端 ──────────────────────────────────────────
@@ -565,6 +617,7 @@ def do_polish() -> None:
                 "summary": summary,
                 "style_tags": tags,
                 "avoid_text": avoid_text,
+                "doc_path": doc_path,
             },
             timeout=300,
         )
@@ -577,6 +630,10 @@ def do_polish() -> None:
         _remember_variation(variation_key, polished)
         if _apply_to_range(rng, original, polished, "润色"):
             _status("润色完成")
+            _maybe_check_consistency(
+                _canon(rng.Text), doc_path, before, after,
+                "润色", int(rng.Start), int(rng.End),
+            )
 
     submit_job(work, ok, _report_error)
 
@@ -626,6 +683,7 @@ def do_rewrite() -> None:
                 "summary": summary,
                 "style_tags": tags,
                 "avoid_text": avoid_text,
+                "doc_path": doc_path,
             },
             timeout=300,
         )
@@ -638,6 +696,10 @@ def do_rewrite() -> None:
         _remember_variation(variation_key, rewritten)
         if _apply_to_range(rng, original, rewritten, "改写"):
             _status(f"已按「{style}」改写")
+            _maybe_check_consistency(
+                _canon(rng.Text), doc_path, before, after,
+                "改写", int(rng.Start), int(rng.End),
+            )
 
     submit_job(work, ok, _report_error)
 
@@ -793,6 +855,8 @@ def _start_continue(target_length: int = 0) -> None:
         "chars": 0,
         "record_open": False,
         "variation_key": variation_key,
+        "context_before": context_before,
+        "context_after": context_after,
     }
     _continue_active = True
     body = {
@@ -802,6 +866,7 @@ def _start_continue(target_length: int = 0) -> None:
         "style_tags": tags,
         "target_length": max(0, int(target_length or 0)),
         "avoid_text": _recall_variation(variation_key),
+        "doc_path": doc_path,
     }
     _status("正在续写..." + (f"（目标约 {target_length} 字）" if target_length else ""))
     threading.Thread(target=_stream_worker, args=(body,), daemon=True).start()
@@ -865,8 +930,19 @@ def _drain_stream() -> None:
         elif kind in ("done", "cancelled"):
             if _continue_active:
                 _flush_continue_buffer(state, final=True)
+                generated = _canon("".join(state["parts"]))
+                start_pos = int(state["start"])
+                end_pos = int(state["rng"].End)
+                doc_path = state["doc_path"]
+                context_before = state.get("context_before", "")
+                context_after = state.get("context_after", "")
                 _finish_continue()
                 _status("续写完成")
+                if kind == "done" and generated:
+                    _maybe_check_consistency(
+                        generated, doc_path, context_before, context_after,
+                        "续写", start_pos, end_pos,
+                    )
             else:
                 _finish_continue()
                 _status("续写已停止")
@@ -906,6 +982,196 @@ def do_undo_last() -> None:
             state["end"] = min(int(state["end"]), op["start"])
     _last_ai_op = None
     _status(f"已撤销上一次 AI 修改（{op['label']}）")
+
+
+def _apply_consistency_fix(op: dict, fixed_text: str) -> bool:
+    """把修正文本写回原来的区间；原文变化时拒绝。"""
+    try:
+        doc = word_app.ActiveDocument
+        if _doc_key(doc) != op["doc_path"]:
+            _status("当前文档已变化，无法应用修正")
+            return False
+        rng = doc.Range(int(op["start"]), int(op["end"]))
+        if _canon(rng.Text) != _canon(op["text"]):
+            _status("原文内容已变化，无法安全替换（可复制修正文本手动处理）")
+            return False
+        word_text = _to_word(fixed_text)
+        _begin_undo("连贯性修正")
+        try:
+            rng.Text = word_text
+        finally:
+            _end_undo()
+        _record_op(
+            op["doc_path"], int(op["start"]), int(rng.End),
+            str(op["text"]), word_text, "连贯性修正",
+        )
+        return True
+    except Exception as exc:
+        log.exception("应用连贯性修正失败")
+        _status(f"应用修正失败：{exc}")
+        return False
+
+
+def do_show_consistency() -> None:
+    op = _last_consistency
+    if not op:
+        _status("暂无连贯性检查结果")
+        return
+
+    issues = op.get("issues") or []
+    lines = [
+        "【连贯性检查】",
+        f"动作：{op.get('action') or 'AI 生成'}    发现 {len(issues)} 处可能矛盾",
+        "",
+    ]
+    for index, issue in enumerate(issues, 1):
+        if isinstance(issue, dict):
+            issue_type = issue.get("type") or "问题"
+            detail = issue.get("detail") or ""
+            evidence = issue.get("evidence") or ""
+            lines.append(f"{index}. [{issue_type}] {detail}")
+            if evidence:
+                lines.append(f"   依据：{evidence}")
+        else:
+            lines.append(f"{index}. {issue}")
+    suggestion = str(op.get("suggestion") or "").strip()
+    if suggestion:
+        lines.extend(["", "修改建议：", suggestion])
+    lines.extend(["", "AI 生成文本：", op.get("text") or ""])
+
+    win = tk.Toplevel(root)
+    win.title("WordAI 连贯性检查")
+    win.geometry("820x640")
+    text = ScrolledText(win, wrap="word", font=("Microsoft YaHei UI", 10))
+    text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+    text.insert("1.0", "\n".join(lines))
+
+    bar = tk.Frame(win)
+    bar.pack(fill=tk.X, padx=8, pady=(0, 8))
+    fix_btn = tk.Button(bar, text="AI 修正并替换", width=16)
+
+    def copy_all():
+        root.clipboard_clear()
+        root.clipboard_append(text.get("1.0", tk.END).rstrip("\n"))
+        _status("连贯性检查结果已复制")
+
+    def fix():
+        fix_btn.configure(state=tk.DISABLED)
+        _status("正在按检查结果修正...")
+
+        def ok(result):
+            fixed = str((result or {}).get("fixed_text") or "")
+            if not fixed.strip():
+                fix_btn.configure(state=tk.NORMAL)
+                _status("AI 未返回修正文本")
+                return
+            global _last_consistency
+            if _apply_consistency_fix(op, fixed):
+                _last_consistency = None
+                _status("已按连贯性检查结果修正")
+                win.destroy()
+            else:
+                fix_btn.configure(state=tk.NORMAL)
+
+        def err(exc):
+            fix_btn.configure(state=tk.NORMAL)
+            _report_error(exc)
+
+        submit_job(
+            lambda: api_post(
+                "/api/consistency/fix",
+                {"text": op["text"], "issues": issues, "doc_path": op["doc_path"]},
+                timeout=300,
+            ),
+            ok,
+            err,
+        )
+
+    fix_btn.configure(command=fix)
+    fix_btn.pack(side=tk.LEFT, padx=(0, 6))
+    tk.Button(bar, text="复制", width=10, command=copy_all).pack(side=tk.LEFT, padx=(0, 6))
+    tk.Button(bar, text="关闭", width=10, command=win.destroy).pack(side=tk.RIGHT)
+
+
+def _show_memory_dialog(doc_path: str, content: str) -> None:
+    win = tk.Toplevel(root)
+    win.title("WordAI 故事记忆")
+    win.geometry("820x660")
+    text = ScrolledText(win, wrap="word", font=("Microsoft YaHei UI", 10))
+    text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+    text.insert("1.0", content)
+
+    bar = tk.Frame(win)
+    bar.pack(fill=tk.X, padx=8, pady=(0, 8))
+    rebuild_btn = tk.Button(bar, text="重建检索索引", width=14)
+
+    def copy_all():
+        root.clipboard_clear()
+        root.clipboard_append(text.get("1.0", tk.END).rstrip("\n"))
+        _status("故事记忆已复制")
+
+    def rebuild():
+        full_text = get_full_text()
+        if not full_text.strip():
+            _status("未打开文档，无法重建索引")
+            return
+        rebuild_btn.configure(state=tk.DISABLED)
+        _status("正在重建本地检索索引...")
+
+        def ok(result):
+            rebuild_btn.configure(state=tk.NORMAL)
+            _status(f"检索索引已重建：{int((result or {}).get('chunks') or 0)} 块")
+
+        def err(exc):
+            rebuild_btn.configure(state=tk.NORMAL)
+            _report_error(exc)
+
+        submit_job(
+            lambda: api_post(
+                "/api/memory/index", {"doc_path": doc_path, "text": full_text}, timeout=300
+            ),
+            ok,
+            err,
+        )
+
+    rebuild_btn.configure(command=rebuild)
+    rebuild_btn.pack(side=tk.LEFT, padx=(0, 6))
+    tk.Button(bar, text="复制", width=10, command=copy_all).pack(side=tk.LEFT, padx=(0, 6))
+    tk.Button(bar, text="关闭", width=10, command=win.destroy).pack(side=tk.RIGHT)
+
+
+def do_show_memory() -> None:
+    doc_path = _doc_key()
+
+    def ok(memory):
+        state = (memory or {}).get("story_state") or {}
+        chapters = (memory or {}).get("chapters") or []
+        lines = ["【故事记忆】", f"文档：{doc_path}", "", "■ 当前故事状态"]
+        if state:
+            lines.append(json.dumps(state, ensure_ascii=False, indent=2))
+        else:
+            lines.append("（暂无，请先按 Ctrl+Shift+G 生成概要）")
+        lines.append("")
+        lines.append(f"■ 章节记忆（{len(chapters)} 段）")
+        if chapters:
+            for chapter in chapters:
+                index = chapter.get("chapter_index", "?")
+                title = chapter.get("title") or f"第{index}段"
+                summary = str(chapter.get("summary") or "").strip()
+                lines.append(f"第{index}段 · {title}")
+                if summary:
+                    lines.append(f"  {summary}")
+        else:
+            lines.append("（暂无。章节记忆会在生成/自动更新概要时建立）")
+        lines.append("")
+        lines.append("提示：这里展示的是注入 AI 的事实约束；重建索引不会重新生成章节记忆。")
+        _show_memory_dialog(doc_path, "\n".join(lines))
+
+    submit_job(
+        lambda: api_get("/api/memory/get", {"doc_path": doc_path}, timeout=30),
+        ok,
+        _report_error,
+    )
 
 
 # ── 概要生成 ─────────────────────────────────────────────
@@ -1355,20 +1621,38 @@ def do_summary_manager() -> None:
         )
         if not filename:
             return
-        payload = {
-            "doc_path": item["doc_path"],
-            "summary": summary,
-            "summarized_end": item.get("summarized_end", 0),
-            "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        try:
-            Path(filename).write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-        except Exception as exc:
-            messagebox.showerror(APP_TITLE, f"导出失败：{exc}", parent=win)
-            return
-        status_var.set(f"已导出到 {filename}")
+
+        def write_file(memory):
+            payload = {
+                "doc_path": item["doc_path"],
+                "summary": summary,
+                "summarized_end": item.get("summarized_end", 0),
+                "story_state": (memory or {}).get("story_state") or {},
+                "chapters": (memory or {}).get("chapters") or [],
+                "exported_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            try:
+                Path(filename).write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            except Exception as exc:
+                messagebox.showerror(APP_TITLE, f"导出失败：{exc}", parent=win)
+                return
+            status_var.set(f"已导出到 {filename}")
+
+        def ok(memory):
+            write_file(memory)
+
+        def fallback(exc):
+            log.warning("导出时读取故事记忆失败: %s", _describe_error(exc))
+            write_file({})
+            status_var.set(f"概要已导出（记忆读取失败）到 {filename}")
+
+        submit_job(
+            lambda: api_get("/api/memory/get", {"doc_path": item["doc_path"]}, timeout=30),
+            ok,
+            fallback,
+        )
 
     def do_import():
         item = selected_item()
@@ -1390,9 +1674,13 @@ def do_summary_manager() -> None:
         if isinstance(data, dict) and isinstance(data.get("summary"), dict):
             summary = data["summary"]
             summarized_end = _as_int(data.get("summarized_end"), 0)
+            story_state = data.get("story_state") if isinstance(data.get("story_state"), dict) else {}
+            chapters = data.get("chapters") if isinstance(data.get("chapters"), list) else []
         elif isinstance(data, dict):
             summary = data
             summarized_end = 0
+            story_state = {}
+            chapters = []
         else:
             messagebox.showerror(APP_TITLE, "文件中没有有效的概要 JSON 对象。", parent=win)
             return
@@ -1409,6 +1697,8 @@ def do_summary_manager() -> None:
                     "doc_path": item["doc_path"],
                     "summary": summary,
                     "summarized_end": summarized_end,
+                    "story_state": story_state,
+                    "chapters": chapters,
                 },
                 timeout=30,
             ),
@@ -1629,6 +1919,8 @@ def show_help() -> None:
         "Ctrl+Alt+P          角色卡（梗概/关系/后续发展，可 AI 完善）\n"
         "Ctrl+Alt+Z          撤销上一次 AI 修改\n"
         "Ctrl+Alt+M          打开作品库（查看/编辑/导入/导出概要）\n"
+        "Ctrl+Alt+N          故事记忆（当前状态/章节记忆/重建检索索引）\n"
+        "Ctrl+Alt+V          查看最近一次连贯性检查结果\n"
         "Ctrl+Alt+U          开启/关闭自动概要更新\n"
         "Ctrl+Alt+K          设置 API Key\n"
         "Ctrl+Alt+H          显示本帮助\n"
@@ -1638,6 +1930,8 @@ def show_help() -> None:
         "保存文档后，新增内容超过阈值时会自动增量更新概要。\n"
         "阈值与间隔可在 config/settings.json 中调整：\n"
         "  auto_summary_threshold / auto_summary_min_interval\n"
+        "故事记忆/本地检索/连贯性自检开关：\n"
+        "  memory_enabled / consistency_check\n"
         "\n"
         "提示：AI 修改后按 Ctrl+Z 可以整段撤销；\n"
         "Ctrl+Alt+Z 仅撤销最近一次 AI 修改。"
@@ -1663,6 +1957,8 @@ HOTKEY_TOGGLE_AUTO = 10
 HOTKEY_HELP = 11
 HOTKEY_QUIT = 12
 HOTKEY_APIKEY = 13
+HOTKEY_CONSISTENCY = 14
+HOTKEY_MEMORY = 15
 
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
@@ -1673,7 +1969,7 @@ HWND_MESSAGE = -3
 VK: dict[str, int] = {
     "E": 0x45, "RETURN": 0x0D, "G": 0x47, "R": 0x52, "O": 0x4F,
     "C": 0x43, "L": 0x4C, "P": 0x50, "Z": 0x5A, "M": 0x4D, "U": 0x55,
-    "H": 0x48, "Q": 0x51, "K": 0x4B,
+    "H": 0x48, "Q": 0x51, "K": 0x4B, "V": 0x56, "N": 0x4E,
 }
 
 WNDPROC = WINFUNCTYPE(
@@ -1753,6 +2049,8 @@ _HOTKEY_SPECS = [
     (HOTKEY_MANAGER, MOD_CONTROL | MOD_ALT, VK["M"], "Ctrl+Alt+M 作品库"),
     (HOTKEY_TOGGLE_AUTO, MOD_CONTROL | MOD_ALT, VK["U"], "Ctrl+Alt+U 自动概要开关"),
     (HOTKEY_APIKEY, MOD_CONTROL | MOD_ALT, VK["K"], "Ctrl+Alt+K 设置 API Key"),
+    (HOTKEY_CONSISTENCY, MOD_CONTROL | MOD_ALT, VK["V"], "Ctrl+Alt+V 连贯性检查"),
+    (HOTKEY_MEMORY, MOD_CONTROL | MOD_ALT, VK["N"], "Ctrl+Alt+N 故事记忆"),
     (HOTKEY_HELP, MOD_CONTROL | MOD_ALT, VK["H"], "Ctrl+Alt+H 帮助"),
     (HOTKEY_QUIT, MOD_CONTROL | MOD_ALT, VK["Q"], "Ctrl+Alt+Q 退出"),
 ]
@@ -1818,6 +2116,8 @@ _ACTIONS = {
     HOTKEY_HELP: show_help,
     HOTKEY_QUIT: lambda: on_close(),
     HOTKEY_APIKEY: do_set_api_key,
+    HOTKEY_CONSISTENCY: do_show_consistency,
+    HOTKEY_MEMORY: do_show_memory,
 }
 
 
