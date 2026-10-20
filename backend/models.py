@@ -8,6 +8,7 @@ class PolishRequest(BaseModel):
     context_after: str = Field("", description="后文")
     summary: dict[str, object] = Field(default_factory=dict, description="全局概要")
     style_tags: list[str] = Field(default_factory=list)
+    avoid_text: str = Field("", description="上一次生成的内容，避免重复")
 
 
 class PolishResponse(BaseModel):
@@ -21,6 +22,7 @@ class RewriteRequest(BaseModel):
     style: str = Field("更简洁", description="目标风格")
     summary: dict[str, object] = Field(default_factory=dict)
     style_tags: list[str] = Field(default_factory=list)
+    avoid_text: str = Field("", description="上一次生成的内容，避免重复")
 
 
 class ContinueRequest(BaseModel):
@@ -29,6 +31,7 @@ class ContinueRequest(BaseModel):
     summary: dict[str, object] = Field(default_factory=dict)
     style_tags: list[str] = Field(default_factory=list)
     target_length: int = Field(0, ge=0, le=20000, description="目标字数，0 表示不限")
+    avoid_text: str = Field("", description="上一次生成的内容，避免重复")
 
 
 class OutlineRequest(BaseModel):

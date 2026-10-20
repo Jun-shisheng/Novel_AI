@@ -1,5 +1,36 @@
 """Prompt 模板和概要注入."""
 import json
+import random
+
+# 同一段落重复润色/续写时，随机换一个侧重点，保证每次结果不同
+_VARIATION_DIRECTIVES = [
+    "更侧重环境与氛围描写",
+    "更侧重人物心理与内心独白",
+    "更侧重动作与感官细节",
+    "更侧重对话的节奏与潜台词",
+    "换一个叙事切入点，避免与上一次雷同",
+    "调整句式节奏，长短句交错",
+    "表达更克制，适当留白",
+    "画面感更强，减少抽象概括",
+    "换用不同的比喻和意象",
+    "从人物当下的情绪出发重新组织语言",
+]
+
+
+def _variation_hint() -> str:
+    return random.choice(_VARIATION_DIRECTIVES)
+
+
+def _append_avoid_section(user: str, avoid_text: str) -> str:
+    avoid_text = str(avoid_text or "").strip()
+    if not avoid_text:
+        return user
+    return (
+        user
+        + "\n## 上次生成（仅供对照，禁止重复其措辞、句式和描写顺序）\n"
+        + avoid_text[:2000]
+        + "\n"
+    )
 
 
 def _summary_json(summary: dict) -> str:
@@ -17,6 +48,7 @@ def build_polish_prompt(
     summary: dict,
     style_tags: list[str],
     expand_ratio: float = 1.3,
+    avoid_text: str = "",
 ) -> list[dict]:
     try:
         percent = round((float(expand_ratio) - 1) * 100)
@@ -33,6 +65,8 @@ def build_polish_prompt(
         "4. 不改变人称和视角\n"
         "5. 直接输出润色后的文本，不要加任何解释或标记\n"
         "6. 段落之间不要增加空行，保持原文的段落间距格式\n"
+        "7. 同一段文字每次润色都应有不同写法，避免套路化\n"
+        f"8. 本次创作方向：{_variation_hint()}\n"
         f"风格参考：{_style_str(style_tags)}"
     )
 
@@ -40,9 +74,10 @@ def build_polish_prompt(
         f"## 前文（保持连贯）\n{context_before}\n\n"
         f"## 待润色段落\n{text}\n\n"
         f"## 后文（保持连贯）\n{context_after}\n\n"
-        f"## 作品概要\n{_summary_json(summary)}\n\n"
-        "请输出润色扩写后的完整段落，直接替换原文："
+        f"## 作品概要\n{_summary_json(summary)}\n"
     )
+    user = _append_avoid_section(user, avoid_text)
+    user += "\n请输出润色扩写后的完整段落，直接替换原文："
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -56,6 +91,7 @@ def build_rewrite_prompt(
     summary: dict,
     style_tags: list[str],
     style: str,
+    avoid_text: str = "",
 ) -> list[dict]:
     system = (
         "你是一位专业的小说编辑，擅长按照指定风格改写文字。\n"
@@ -65,6 +101,8 @@ def build_rewrite_prompt(
         "3. 只改变语言风格与表达方式，长度与原文接近\n"
         "4. 直接输出改写后的文本，不要加任何解释、标题或标记\n"
         "5. 段落之间不要增加空行\n"
+        "6. 同一段文字每次改写都应有不同写法，避免套路化\n"
+        f"7. 本次创作方向：{_variation_hint()}\n"
         f"作品原有风格参考：{_style_str(style_tags)}"
     )
     user = (
@@ -72,9 +110,10 @@ def build_rewrite_prompt(
         f"## 前文（保持连贯）\n{context_before}\n\n"
         f"## 待改写段落\n{text}\n\n"
         f"## 后文（保持连贯）\n{context_after}\n\n"
-        f"## 作品概要\n{_summary_json(summary)}\n\n"
-        "请输出改写后的完整段落，直接替换原文："
+        f"## 作品概要\n{_summary_json(summary)}\n"
     )
+    user = _append_avoid_section(user, avoid_text)
+    user += "\n请输出改写后的完整段落，直接替换原文："
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -87,6 +126,7 @@ def build_continue_prompt(
     summary: dict,
     style_tags: list[str],
     target_length: int = 0,
+    avoid_text: str = "",
 ) -> list[dict]:
     system = (
         "你是一位专业的小说作家，擅长根据上下文无缝续写。\n"
@@ -96,18 +136,21 @@ def build_continue_prompt(
         "3. 保持对话风格、节奏感与原文一致\n"
         "4. 不要重复已有内容，从光标处自然延续\n"
         "5. 合理分段，段落之间用一个空行分隔（即两个换行符）\n"
-        "6. 直接输出续写文本，不要加解释"
+        "6. 直接输出续写文本，不要加解释\n"
+        "7. 同一起点每次续写都应换一种发展方式，避免雷同"
     )
     if target_length:
-        system += f"\n7. 本次续写目标约 {target_length} 字，达到目标后自然收束，不要无限续写"
+        system += f"\n8. 本次续写目标约 {target_length} 字，达到目标后自然收束，不要无限续写"
+    system += f"\n9. 本次创作方向：{_variation_hint()}"
     system += f"\n风格：{_style_str(style_tags)}"
 
     user = (
         f"## 前文（从光标往前）\n{context_before}\n\n"
         f"## 后文（光标之后的内容，避免矛盾）\n{context_after}\n\n"
-        f"## 作品概要\n{_summary_json(summary)}\n\n"
-        "请从光标位置自然续写："
+        f"## 作品概要\n{_summary_json(summary)}\n"
     )
+    user = _append_avoid_section(user, avoid_text)
+    user += "\n请从光标位置自然续写："
     return [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
