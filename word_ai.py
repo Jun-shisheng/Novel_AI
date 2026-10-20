@@ -5,6 +5,7 @@ Ctrl+Shift+E 润色，Ctrl+Shift+Enter 续写启停，Ctrl+Shift+G 生成概要�
 Ctrl+Alt+H 查看全部快捷键。
 """
 import ctypes
+import hashlib
 import json
 import logging
 import os
@@ -97,6 +98,10 @@ _stream_queue: queue.Queue = queue.Queue()
 _last_ai_op: dict | None = None
 _undo_open = False
 
+# 记录同一段文字最近一次 AI 输出，重试时要求换一种写法
+_VARIATION_HISTORY: dict[str, str] = {}
+_VARIATION_LIMIT = 64
+
 # 热键动作队列：消息窗口线程 → 主线程
 _action_queue: queue.Queue = queue.Queue()
 # 网络任务结果队列：工作线程 → 主线程
@@ -135,6 +140,24 @@ def _to_word(text: str, collapse_blank_lines: bool = True) -> str:
     if collapse_blank_lines:
         text = re.sub(r"\n{2,}", "\n", text)
     return text.strip("\n").replace("\n", "\r")
+
+
+def _variation_key(kind: str, doc_path: str, text: str, extra: str = "") -> str:
+    digest = hashlib.sha1(_canon(text).encode("utf-8")).hexdigest()
+    return f"{kind}:{doc_path}:{extra}:{digest}"
+
+
+def _recall_variation(key: str) -> str:
+    return _VARIATION_HISTORY.get(key, "")
+
+
+def _remember_variation(key: str, text: str) -> None:
+    text = str(text or "").strip()
+    if not key or not text:
+        return
+    _VARIATION_HISTORY[key] = text[:4000]
+    while len(_VARIATION_HISTORY) > _VARIATION_LIMIT:
+        _VARIATION_HISTORY.pop(next(iter(_VARIATION_HISTORY)))
 
 
 def _describe_error(exc) -> str:
@@ -520,6 +543,7 @@ def do_polish() -> None:
             _status("请先选中文本")
             return
         original = str(rng.Text)
+        doc_path = _doc_key()
         summary, tags = get_summary()
         before = get_text_before(_as_int(_settings.get("polish_before_chars"), 500))
         after = get_text_after(_as_int(_settings.get("polish_after_chars"), 200))
@@ -527,6 +551,8 @@ def do_polish() -> None:
         _status(f"读取选区失败：{exc}")
         return
 
+    variation_key = _variation_key("polish", doc_path, text)
+    avoid_text = _recall_variation(variation_key)
     _status("正在润色...")
 
     def work():
@@ -538,6 +564,7 @@ def do_polish() -> None:
                 "context_after": after,
                 "summary": summary,
                 "style_tags": tags,
+                "avoid_text": avoid_text,
             },
             timeout=300,
         )
@@ -547,6 +574,7 @@ def do_polish() -> None:
         if not polished.strip():
             _status("AI 返回内容为空，已取消")
             return
+        _remember_variation(variation_key, polished)
         if _apply_to_range(rng, original, polished, "润色"):
             _status("润色完成")
 
@@ -565,6 +593,7 @@ def do_rewrite() -> None:
             _status("请先选中文本")
             return
         original = str(rng.Text)
+        doc_path = _doc_key()
         summary, tags = get_summary()
         before = get_text_before(_as_int(_settings.get("polish_before_chars"), 500))
         after = get_text_after(_as_int(_settings.get("polish_after_chars"), 200))
@@ -582,6 +611,8 @@ def do_rewrite() -> None:
         return
     style = style.strip()
 
+    variation_key = _variation_key("rewrite", doc_path, text, extra=style)
+    avoid_text = _recall_variation(variation_key)
     _status(f"正在按「{style}」风格改写...")
 
     def work():
@@ -594,6 +625,7 @@ def do_rewrite() -> None:
                 "style": style,
                 "summary": summary,
                 "style_tags": tags,
+                "avoid_text": avoid_text,
             },
             timeout=300,
         )
@@ -603,6 +635,7 @@ def do_rewrite() -> None:
         if not rewritten.strip():
             _status("AI 返回内容为空，已取消")
             return
+        _remember_variation(variation_key, rewritten)
         if _apply_to_range(rng, original, rewritten, "改写"):
             _status(f"已按「{style}」改写")
 
@@ -664,13 +697,18 @@ def _finish_continue() -> None:
     if state.get("record_open"):
         _end_undo()
     if state["parts"]:
+        generated = "".join(state["parts"])
         _record_op(
             state["doc_path"],
             state["start"],
             int(state["rng"].End),
             "",
-            "".join(state["parts"]),
+            generated,
             "续写",
+        )
+        _remember_variation(
+            state.get("variation_key", ""),
+            generated.replace("\r", "\n"),
         )
     for key in ("rng",):
         state.pop(key, None)
@@ -741,6 +779,10 @@ def _start_continue(target_length: int = 0) -> None:
         except queue.Empty:
             break
 
+    ctx_digest = hashlib.sha1(
+        (context_before[-500:] + "|" + context_after[:200]).encode("utf-8")
+    ).hexdigest()
+    variation_key = f"continue:{doc_path}:{start}:{ctx_digest}"
     _continue_state = {
         "doc_path": doc_path,
         "rng": rng,
@@ -750,6 +792,7 @@ def _start_continue(target_length: int = 0) -> None:
         "buffer": "",
         "chars": 0,
         "record_open": False,
+        "variation_key": variation_key,
     }
     _continue_active = True
     body = {
@@ -758,6 +801,7 @@ def _start_continue(target_length: int = 0) -> None:
         "summary": summary,
         "style_tags": tags,
         "target_length": max(0, int(target_length or 0)),
+        "avoid_text": _recall_variation(variation_key),
     }
     _status("正在续写..." + (f"（目标约 {target_length} 字）" if target_length else ""))
     threading.Thread(target=_stream_worker, args=(body,), daemon=True).start()

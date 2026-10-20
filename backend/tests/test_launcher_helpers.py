@@ -29,6 +29,17 @@ class LauncherHelpersTests(unittest.TestCase):
         word_ai.do_undo_last()
         self.assertIsNone(word_ai._last_ai_op)
 
+    def test_variation_key_and_history(self):
+        word_ai._VARIATION_HISTORY.clear()
+        key1 = word_ai._variation_key("polish", "doc.docx", "同一段文字")
+        key2 = word_ai._variation_key("polish", "doc.docx", "同一段文字")
+        key3 = word_ai._variation_key("polish", "doc.docx", "另一段文字")
+        self.assertEqual(key1, key2)
+        self.assertNotEqual(key1, key3)
+        word_ai._remember_variation(key1, "上次的输出")
+        self.assertEqual(word_ai._recall_variation(key1), "上次的输出")
+        word_ai._VARIATION_HISTORY.clear()
+
 
 if __name__ == "__main__":
     unittest.main()

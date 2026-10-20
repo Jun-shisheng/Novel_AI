@@ -82,6 +82,21 @@ class PromptTests(unittest.TestCase):
         messages = build_rewrite_prompt("原文", "", "", {}, [], "更简洁")
         self.assertIn("更简洁", messages[1]["content"])
 
+    def test_polish_avoid_text_and_variation(self):
+        messages = build_polish_prompt("正文", "", "", {}, [], avoid_text="上次的句子")
+        self.assertIn("本次创作方向", messages[0]["content"])
+        self.assertIn("上次生成", messages[1]["content"])
+        self.assertIn("上次的句子", messages[1]["content"])
+
+    def test_continue_avoid_text(self):
+        messages = build_continue_prompt("前", "后", {}, [], avoid_text="上次续写")
+        self.assertIn("本次创作方向", messages[0]["content"])
+        self.assertIn("上次续写", messages[1]["content"])
+
+    def test_rewrite_avoid_text(self):
+        messages = build_rewrite_prompt("原文", "", "", {}, [], "更简洁", avoid_text="上次改写")
+        self.assertIn("上次改写", messages[1]["content"])
+
     def test_summary_prompt_has_character_arc_fields(self):
         system = build_summary_chunk_prompt("正文", is_first=True)
         system_text = system[-1]["content"]

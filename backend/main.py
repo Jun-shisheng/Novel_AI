@@ -89,8 +89,9 @@ async def polish(req: PolishRequest):
         req.text, req.context_before, req.context_after,
         req.summary, req.style_tags,
         expand_ratio=cfg.get("polish_expand_ratio", 1.3),
+        avoid_text=req.avoid_text,
     )
-    result = await _run_ai(chat_completion(messages, temperature=0.7, max_tokens=4096))
+    result = await _run_ai(chat_completion(messages, temperature=0.9, max_tokens=4096))
     return PolishResponse(polished_text=result)
 
 
@@ -99,8 +100,9 @@ async def rewrite(req: RewriteRequest):
     messages = build_rewrite_prompt(
         req.text, req.context_before, req.context_after,
         req.summary, req.style_tags, req.style,
+        avoid_text=req.avoid_text,
     )
-    result = await _run_ai(chat_completion(messages, temperature=0.7, max_tokens=4096))
+    result = await _run_ai(chat_completion(messages, temperature=0.9, max_tokens=4096))
     return PolishResponse(polished_text=result)
 
 
@@ -110,7 +112,7 @@ async def continue_write(req: ContinueRequest):
     cancel_event = cancel_manager.create(session_id)
     messages = build_continue_prompt(
         req.context_before, req.context_after,
-        req.summary, req.style_tags, req.target_length,
+        req.summary, req.style_tags, req.target_length, req.avoid_text,
     )
 
     async def event_generator():
