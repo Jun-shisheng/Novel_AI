@@ -14,6 +14,7 @@ BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
 
 import database  # noqa: E402
+import memory_manager  # noqa: E402
 import summary_manager  # noqa: E402
 from prompt_builder import (  # noqa: E402
     build_polish_prompt,
@@ -21,6 +22,8 @@ from prompt_builder import (  # noqa: E402
     build_rewrite_prompt,
     build_character_card_prompt,
     build_summary_chunk_prompt,
+    build_consistency_check_prompt,
+    build_consistency_fix_prompt,
 )
 from text_chunker import chunk_text  # noqa: E402
 from utils import extract_json  # noqa: E402
@@ -97,6 +100,28 @@ class PromptTests(unittest.TestCase):
         messages = build_rewrite_prompt("原文", "", "", {}, [], "更简洁", avoid_text="上次改写")
         self.assertIn("上次改写", messages[1]["content"])
 
+    def test_memory_injection(self):
+        memory = {
+            "story_state": {"地点": "演武场", "在场人物": ["林舟"]},
+            "recent_chapters": [
+                {"chapter_index": 1, "title": "第一章", "summary": "林舟开始试炼"}
+            ],
+            "retrieved": [{"text": "古剑在月光下发光"}],
+        }
+        messages = build_polish_prompt("正文", "前", "后", {}, [], memory=memory)
+        user = messages[1]["content"]
+        self.assertIn("当前故事状态", user)
+        self.assertIn("近期章节记忆", user)
+        self.assertIn("古剑在月光下发光", user)
+
+    def test_consistency_prompts(self):
+        memory = {"story_state": {"地点": "演武场"}}
+        check = build_consistency_check_prompt("文本", "前", "后", {}, memory)
+        self.assertIn("issues", check[0]["content"])
+        self.assertIn("当前故事状态", check[1]["content"])
+        fix = build_consistency_fix_prompt("文本", [{"type": "地点"}], {}, memory)
+        self.assertIn("地点", fix[1]["content"])
+
     def test_summary_prompt_has_character_arc_fields(self):
         system = build_summary_chunk_prompt("正文", is_first=True)
         system_text = system[-1]["content"]
@@ -152,9 +177,18 @@ class SummaryManagerTests(unittest.IsolatedAsyncioTestCase):
                 },
                 ensure_ascii=False,
             )
-        if "新增信息" in user or "合并" in messages[0]["content"]:
+        if "以下是追加的小说片段" in user or "合并" in messages[0]["content"]:
             return json.dumps(
                 {
+                    "本段概要": "林舟在演武场继续试炼，古剑异动。",
+                    "本段结束状态": {
+                        "时间": "傍晚",
+                        "地点": "演武场",
+                        "在场人物": ["林舟", "苏晚"],
+                        "关键物品": ["古剑"],
+                        "未解决线索": ["古剑来历"],
+                        "关系变化": ["林舟与苏晚开始互相信任"],
+                    },
                     "主角": {"姓名": "林舟", "当前状态": "筑基"},
                     "情节线": "试炼继续",
                     "人物": [{"姓名": "苏晚", "角色": "同伴", "与其他人物关系": "同门"}],
@@ -166,6 +200,15 @@ class SummaryManagerTests(unittest.IsolatedAsyncioTestCase):
             )
         return json.dumps(
             {
+                "本段概要": "林舟在演武场开始试炼，古剑第一次发光。",
+                "本段结束状态": {
+                    "时间": "清晨",
+                    "地点": "演武场",
+                    "在场人物": ["林舟"],
+                    "关键物品": ["古剑"],
+                    "未解决线索": ["古剑来历"],
+                    "关系变化": [],
+                },
                 "主角": {"姓名": "林舟", "当前状态": "入门"},
                 "情节线": "试炼开始",
                 "人物": [],
@@ -179,7 +222,9 @@ class SummaryManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_generate_save_state_and_list(self):
         summary_manager.chat_completion = self._fake_chat
         summary = await summary_manager.generate_summary(
-            "第一段。\r第二段。", "C:/novels/book.docx", doc_end=120
+            "第一段，林舟拿起古剑。\r第二段，古剑在月光下发光。",
+            "C:/novels/book.docx",
+            doc_end=120,
         )
         self.assertEqual(summary["主角"]["姓名"], "林舟")
         stored = await summary_manager.get_summary("C:/novels/book.docx")
@@ -188,6 +233,13 @@ class SummaryManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tags, ["仙侠"])
         state = await summary_manager.get_doc_state("C:/novels/book.docx")
         self.assertEqual(state["summarized_end"], 120)
+
+        mem_state = await memory_manager.get_story_state("C:/novels/book.docx")
+        self.assertEqual(mem_state["地点"], "演武场")
+        chapters = await memory_manager.get_chapters("C:/novels/book.docx")
+        self.assertEqual(len(chapters), 1)
+        self.assertIn("试炼", chapters[0]["summary"])
+        self.assertTrue(await memory_manager.search("C:/novels/book.docx", "古剑"))
 
         items = await summary_manager.list_summaries()
         self.assertEqual(len(items), 1)
@@ -202,6 +254,10 @@ class SummaryManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated["主角"]["姓名"], "林舟")
         state = await summary_manager.get_doc_state("doc")
         self.assertEqual(state["summarized_end"], 90)
+        mem_state = await memory_manager.get_story_state("doc")
+        self.assertEqual(mem_state["地点"], "演武场")
+        chapters = await memory_manager.get_chapters("doc")
+        self.assertGreaterEqual(len(chapters), 2)
 
     async def test_update_without_existing_uses_full_generation(self):
         summary_manager.chat_completion = self._fake_chat
@@ -244,6 +300,94 @@ class SummaryManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_character_cards_require_context(self):
         with self.assertRaises(ValueError):
             await summary_manager.generate_character_cards("  ", {})
+
+
+class MemoryManagerTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_dir = database.DB_DIR
+        database.DB_DIR = Path(self.tmp.name)
+
+    def tearDown(self):
+        database.DB_DIR = self.old_dir
+        self.tmp.cleanup()
+
+    def test_tokenize_chinese_bigrams_and_ascii(self):
+        tokens = memory_manager.tokenize("林舟拿起古剑，GuJian sword")
+        self.assertIn("林舟", tokens)
+        self.assertIn("古剑", tokens)
+        self.assertIn("gujian", tokens)
+        self.assertIn("sword", tokens)
+
+    async def test_index_search_chapters_and_state(self):
+        text = (
+            "第一章 试炼\n林舟在演武场拿起古剑，剑身第一次发光。\n\n"
+            "第二章 药堂\n苏晚在药堂发现自己的身世线索，决定暂时隐瞒。"
+        )
+        chapters = [
+            {"chapter_index": 1, "title": "第一章 试炼", "summary": "林舟试炼",
+             "state": {"地点": "演武场", "在场人物": ["林舟"]}},
+            {"chapter_index": 2, "title": "第二章 药堂", "summary": "苏晚发现身世",
+             "state": {"地点": "药堂", "在场人物": ["苏晚"]}},
+        ]
+        await memory_manager.replace_memory(
+            "doc", text, chapters, {"地点": "药堂", "未解决线索": ["身世"]}
+        )
+
+        results = await memory_manager.search("doc", "古剑发光", top_k=3)
+        self.assertTrue(any("古剑" in item for item in results))
+        results = await memory_manager.search("doc", "苏晚 身世", top_k=3)
+        self.assertTrue(any("苏晚" in item for item in results))
+
+        memory = await memory_manager.get_memory(
+            "doc", query="古剑", recent_chapters=1
+        )
+        self.assertEqual(memory["story_state"]["地点"], "药堂")
+        self.assertEqual(len(memory["recent_chapters"]), 1)
+        self.assertEqual(memory["recent_chapters"][0]["chapter_index"], 2)
+        self.assertTrue(memory["retrieved"])
+
+        raw = await memory_manager.get_memory_raw("doc")
+        self.assertEqual(len(raw["chapters"]), 2)
+
+    async def test_exclude_current_text(self):
+        text = "古剑" + "很长的正文" * 40
+        await memory_manager.replace_memory("doc", text, [], {})
+        excluded = await memory_manager.search("doc", text, exclude_text=text)
+        self.assertEqual(excluded, [])
+
+    async def test_append_and_clear(self):
+        await memory_manager.replace_memory(
+            "doc", "第一章 林舟出场。", [{"title": "第一章", "summary": "林舟出场"}],
+            {"地点": "山门"},
+        )
+        await memory_manager.append_memory(
+            "doc",
+            "第二章 苏晚在药堂发现身世。",
+            [{"title": "第二章", "summary": "苏晚发现身世",
+              "state": {"地点": "药堂"}}],
+            {"地点": "药堂"},
+        )
+        chapters = await memory_manager.get_chapters("doc")
+        self.assertEqual([c["chapter_index"] for c in chapters], [1, 2])
+        self.assertEqual((await memory_manager.get_story_state("doc"))["地点"], "药堂")
+        self.assertTrue(await memory_manager.search("doc", "身世"))
+
+        await memory_manager.clear_memory("doc")
+        self.assertEqual(await memory_manager.get_chapters("doc"), [])
+        self.assertEqual(await memory_manager.get_story_state("doc"), {})
+        self.assertEqual(await memory_manager.search("doc", "身世"), [])
+
+    async def test_import_memory(self):
+        await memory_manager.import_memory(
+            "doc",
+            [{"chapter_index": 1, "title": "序章", "summary": "导入的章节",
+              "state": {"地点": "客栈"}}],
+            {"地点": "客栈"},
+        )
+        raw = await memory_manager.get_memory_raw("doc")
+        self.assertEqual(raw["story_state"]["地点"], "客栈")
+        self.assertEqual(raw["chapters"][0]["title"], "序章")
 
 
 class OutlineTests(unittest.IsolatedAsyncioTestCase):

@@ -27,6 +27,12 @@ DEFAULT_CONFIG = {
     "auto_summary_threshold": 1200,
     # 两次自动更新之间的最小间隔（秒）
     "auto_summary_min_interval": 60,
+    # 故事记忆：章节记忆/当前状态/本地检索注入
+    "memory_enabled": True,
+    "memory_retrieve_top_k": 4,
+    "memory_recent_chapters": 3,
+    # 生成后连贯性自检（会增加一次 API 调用）
+    "consistency_check": True,
 }
 
 

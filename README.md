@@ -15,6 +15,8 @@
 | `Ctrl+Alt+P` | 角色卡：梗概、当前状态、目标、冲突、人物关系、后续发展 |
 | `Ctrl+Alt+Z` | 撤销上一次 AI 修改（一键恢复原文） |
 | `Ctrl+Alt+M` | 作品库：查看、编辑、导出、导入、删除各文档概要 |
+| `Ctrl+Alt+N` | 故事记忆：当前状态、章节记忆、重建本地检索索引 |
+| `Ctrl+Alt+V` | 查看最近一次连贯性检查结果，可让 AI 修正并替换 |
 | `Ctrl+Alt+U` | 开启/关闭自动概要更新 |
 | `Ctrl+Alt+K` | 设置 DeepSeek API Key |
 | `Ctrl+Alt+H` | 查看全部快捷键 |
@@ -49,6 +51,42 @@
 - 润色/改写温度提高到 0.9，降低输出趋同
 
 因此撤销后重新执行，通常会得到另一种写法，而不是原样重放。
+
+### 故事记忆（章节级 + 当前状态）
+
+生成或自动更新概要时，AI 会为每段正文额外提取：
+
+- **本段概要**：这一段发生了什么
+- **本段结束状态**：时间、地点、在场人物、关键物品、未解决线索、关系变化
+- 全局概要中的主角、情节线、伏笔、世界观也会并入当前状态
+
+这些内容存入本地 SQLite，并在润色、改写、续写时作为「事实约束」注入提示词。`Ctrl+Alt+N` 可以查看当前状态和全部章节记忆；「重建检索索引」只重建本地检索，不调用 AI。
+
+### 本地检索（BM25，零依赖）
+
+- 正文按约 1200 字分块，使用中文二元组 + 英文单词建立本地索引
+- 优先使用 SQLite FTS5，不可用时退回纯 Python BM25
+- 根据当前上下文里的角色名、地点、关键词召回最相关的过往段落，作为「相关前文」注入
+- 自动排除当前正在处理的段落，避免把原文再喂回给模型
+- 不需要向量库、嵌入模型或额外 Python 依赖
+
+### 连贯性自检
+
+润色、改写、续写完成后，会额外做一次低温检查（默认开启）：
+
+- 对照当前状态、章节记忆和相关前文，只报告**明确矛盾**：人物状态、时间、地点、物品、关系、设定、情节因果
+- 有问题时只在 Word 状态栏提示，不弹窗；按 `Ctrl+Alt+V` 查看详情
+- 可以在查看窗口里让 AI 只修正矛盾并替换原文；原文已变化时会拒绝覆盖
+- 每次检查会增加一次 API 调用，可在 `config/settings.json` 设置 `consistency_check: false` 关闭
+
+### 能做到什么、做不到什么
+
+这些机制能明显减少「人物瞬移、死人复生、伏笔丢失、长文后段忘设定」等问题，但**不能彻底消除幻觉**：
+
+- 检索可能召回过期或无关段落；摘要会压缩丢失细节
+- 状态是 AI 提取的，可能有错；大段修改前文后建议重新生成概要
+- 自检也可能漏掉矛盾，或把合理创作误判为问题
+- 冲突时以当前正文为准；重要设定建议在作品库里手动修正概要
 
 ### 撤销
 
@@ -117,12 +155,16 @@ backend\venv\Scripts\pip install -r backend\requirements.txt
 | `auto_summary_update` | `true` | 是否自动增量更新概要 |
 | `auto_summary_threshold` | `1200` | 触发自动更新的新增字数阈值 |
 | `auto_summary_min_interval` | `60` | 两次自动更新的最小间隔（秒） |
+| `memory_enabled` | `true` | 是否注入章节记忆/状态/本地检索结果 |
+| `memory_retrieve_top_k` | `4` | 每次检索注入的相关段落数 |
+| `memory_recent_chapters` | `3` | 注入的最近章节记忆条数 |
+| `consistency_check` | `true` | 生成后是否做连贯性自检 |
 
 ## 数据与日志
 
 | 路径 | 内容 |
 |------|------|
-| `.ai-writing/summaries.db` | 各文档概要、风格标签、自动更新位置 |
+| `.ai-writing/summaries.db` | 各文档概要、风格标签、自动更新位置、章节记忆、当前状态、检索索引 |
 | `config/settings.json` | 配置与加密后的 API Key |
 | `logs/word_ai.log` | 启动器日志 |
 | `logs/backend.log` | 后台服务日志 |
@@ -144,10 +186,11 @@ backend\venv\Scripts\pip install -r backend\requirements.txt
 backend/
   main.py             FastAPI 入口与 API 路由
   deepseek_client.py  DeepSeek 封装（流式、超时、429/5xx 重试）
-  prompt_builder.py   润色/改写/续写/大纲/角色卡/概要提示词
-  summary_manager.py  分块提取、增量合并、作品库 CRUD
+  prompt_builder.py   润色/改写/续写/大纲/角色卡/概要/连贯性提示词
+  summary_manager.py  分块提取、增量合并、作品库 CRUD、连贯性检查
+  memory_manager.py   章节记忆、当前状态、本地 BM25 检索（FTS5/纯 Python）
   text_chunker.py     按段落/句子分块（兼容 Word 的 \r 段落标记）
-  database.py         SQLite（summaries / style_tags / doc_state）
+  database.py         SQLite（summaries / style_tags / doc_state / chapter_memory / story_state / memory_chunks）
   config.py           API Key 加密存储与配置
   utils.py            JSON 容错解析、换行规范化
   version.py          版本号（启动器据此判断是否复用后台）
@@ -161,7 +204,7 @@ cd backend
 venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-测试不会访问真实 AI 服务，覆盖分块、JSON 解析、提示词、概要 CRUD、增量更新、角色卡和启动器纯函数。
+共 37 个测试，不会访问真实 AI 服务，覆盖分块、JSON 解析、提示词、概要 CRUD、增量更新、角色卡、章节记忆、状态、本地检索、连贯性提示词和启动器纯函数。
 
 ## 常见问题
 
@@ -186,6 +229,23 @@ venv\Scripts\python.exe -m unittest discover -s tests -v
 - Python 3.11 / 3.12
 - Microsoft Word（Windows）
 - DeepSeek API Key（或兼容 OpenAI 格式的服务）
+
+## 设计参考
+
+故事记忆层参考了以下开源项目的思路（仅借鉴设计，未复制代码）：
+
+| 项目 | 借鉴点 |
+|------|--------|
+| [mem0ai/mem0](https://github.com/mem0ai/mem0) | 事实抽取、检索、可编辑记忆 |
+| [letta-ai/letta](https://github.com/letta-ai/letta) | 核心状态 / 归档记忆 / 按需召回的分层结构 |
+| [HKUDS/LightRAG](https://github.com/HKUDS/LightRAG) | 实体关系 + 多级摘要 + 混合检索 |
+| [microsoft/graphrag](https://github.com/microsoft/graphrag) | 人物关系图与结构化知识 |
+| [SillyTavern/SillyTavern](https://github.com/SillyTavern/SillyTavern) | Character Card、World Info 按需注入 |
+| [YILING0013/AI_NovelGenerator](https://github.com/YILING0013/AI_NovelGenerator) | 长篇上下文衔接与伏笔管理 |
+| [PenglongHuang/chinese-novelist-skill](https://github.com/PenglongHuang/chinese-novelist-skill) | 自动校验与不合格重写 |
+| [EthanYoQ/AI-Novel-Writer](https://github.com/EthanYoQ/AI-Novel-Writer) | 章节蓝图、角色/世界资料、本地全文检索 |
+| [ExplosiveCoderflome/AI-Novel-Writing-Assistant](https://github.com/ExplosiveCoderflome/AI-Novel-Writing-Assistant) | 角色库、世界手册、章节状态、RAG |
+| [THUDM/LongWriter](https://github.com/THUDM/LongWriter) | 长文先规划后写作 |
 
 ## License
 

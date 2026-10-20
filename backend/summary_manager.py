@@ -1,8 +1,10 @@
 """概要 CRUD、增量更新与作品库管理."""
 import json
+import logging
 import re
 from pathlib import Path
 
+import memory_manager
 from database import get_db
 from text_chunker import chunk_text
 from prompt_builder import (
@@ -12,6 +14,8 @@ from prompt_builder import (
     build_outline_chunk_prompt,
     build_outline_merge_prompt,
     build_character_card_prompt,
+    build_consistency_check_prompt,
+    build_consistency_fix_prompt,
 )
 from deepseek_client import chat_completion
 from utils import extract_json, normalize_newlines
@@ -28,6 +32,67 @@ def _coerce_tags(summary: dict) -> list[str]:
 
 def _as_summary_dict(value) -> dict:
     return value if isinstance(value, dict) else {"raw_extractions": value}
+
+
+def _chapter_title(chunk: str, index: int) -> str:
+    lines = normalize_newlines(chunk).strip().split("\n")[:5]
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if re.match(r"^第[0-9一二三四五六七八九十百千万两]+[章节回卷篇]", line) and len(line) <= 40:
+            return line
+        if line.startswith("#") and len(line) <= 60:
+            return line.lstrip("#").strip()
+    return f"第{index}段"
+
+
+def _chapter_records(extractions: list, chunks: list[str]) -> list[dict]:
+    records = []
+    for index, extraction in enumerate(extractions):
+        extraction = extraction if isinstance(extraction, dict) else {}
+        summary_text = str(
+            extraction.get("本段概要") or extraction.get("情节线") or ""
+        ).strip()
+        if not summary_text:
+            raw = normalize_newlines(chunks[index] if index < len(chunks) else "").strip()
+            summary_text = raw.replace("\n", " ")[:120]
+            if len(raw) > 120:
+                summary_text += "…"
+        state = extraction.get("本段结束状态")
+        records.append({
+            "chapter_index": index + 1,
+            "title": _chapter_title(chunks[index] if index < len(chunks) else "", index + 1),
+            "summary": summary_text[:500],
+            "state": state if isinstance(state, dict) else {},
+        })
+    return records
+
+
+def _story_state_from(records: list[dict], summary: dict) -> dict:
+    state = {}
+    for record in records:
+        if isinstance(record.get("state"), dict) and record["state"]:
+            state = dict(record["state"])
+    for key in ("主角", "情节线", "人物", "角色关系", "伏笔", "世界观元素"):
+        if summary.get(key):
+            state[key] = summary[key]
+    return state
+
+
+async def _update_memory(
+    doc_path: str, text: str, extractions: list, chunks: list[str], summary: dict, append: bool
+) -> None:
+    try:
+        records = _chapter_records(extractions, chunks)
+        state = _story_state_from(records, summary)
+        if append:
+            await memory_manager.append_memory(doc_path, text, records, state)
+        else:
+            await memory_manager.replace_memory(doc_path, text, records, state)
+    except Exception:
+        # 记忆层失败不应影响概要本身
+        logging.getLogger("summary_manager").exception("更新故事记忆失败")
 
 
 async def _save_summary_row(db, doc_path: str, summary: dict) -> None:
@@ -133,6 +198,7 @@ async def generate_summary(text: str, doc_path: str, doc_end: int = 0) -> dict:
     finally:
         await db.close()
 
+    await _update_memory(doc_path, text, extractions, chunks, summary, append=False)
     return summary
 
 
@@ -179,6 +245,7 @@ async def update_summary(new_text: str, doc_path: str, doc_end: int = 0) -> dict
     finally:
         await db.close()
 
+    await _update_memory(doc_path, new_text, extractions, chunks, summary, append=True)
     return summary
 
 
@@ -195,7 +262,13 @@ async def save_summary(doc_path: str, summary: dict) -> dict:
     return summary
 
 
-async def import_summary(doc_path: str, summary: dict, summarized_end: int = 0) -> dict:
+async def import_summary(
+    doc_path: str,
+    summary: dict,
+    summarized_end: int = 0,
+    story_state: dict | None = None,
+    chapters: list[dict] | None = None,
+) -> dict:
     """导入概要；summarized_end 为导入文件记录的覆盖位置。"""
     if not isinstance(summary, dict):
         raise ValueError("概要必须是 JSON 对象")
@@ -206,6 +279,7 @@ async def import_summary(doc_path: str, summary: dict, summarized_end: int = 0) 
         await db.commit()
     finally:
         await db.close()
+    await memory_manager.import_memory(doc_path, chapters or [], story_state or {})
     return summary
 
 
@@ -218,6 +292,7 @@ async def delete_summary(doc_path: str) -> None:
         await db.commit()
     finally:
         await db.close()
+    await memory_manager.clear_memory(doc_path)
 
 
 async def list_summaries() -> list[dict]:
@@ -289,6 +364,73 @@ async def generate_character_cards(text: str, summary: dict) -> dict:
     if not isinstance(cards, dict):
         raise ValueError("AI 返回的角色卡格式不正确")
     return cards
+
+
+async def check_consistency(
+    text: str,
+    context_before: str,
+    context_after: str,
+    summary: dict,
+    doc_path: str = "",
+    action: str = "",
+) -> dict:
+    """生成后连贯性自检：只报告明确矛盾。"""
+    text = normalize_newlines(text)
+    if not text.strip():
+        return {"ok": True, "issues": [], "suggestion": ""}
+
+    memory = {}
+    if doc_path:
+        try:
+            memory = await memory_manager.get_memory(
+                doc_path,
+                query=(context_before[-1200:] + "\n" + text + "\n" + context_after[:400]),
+                exclude_text=text,
+                top_k=4,
+                recent_chapters=3,
+            )
+        except Exception:
+            logging.getLogger("summary_manager").exception("读取故事记忆失败")
+
+    messages = build_consistency_check_prompt(
+        text, context_before, context_after, summary or {}, memory
+    )
+    result = await chat_completion(messages, temperature=0.1, max_tokens=1200)
+    try:
+        data = extract_json(result)
+    except ValueError:
+        return {"ok": True, "issues": [], "suggestion": "", "action": action}
+
+    if not isinstance(data, dict):
+        return {"ok": True, "issues": [], "suggestion": "", "action": action}
+    issues = data.get("issues")
+    issues = issues if isinstance(issues, list) else []
+    ok = bool(data.get("ok", True)) and not issues
+    return {
+        "ok": ok,
+        "issues": issues,
+        "suggestion": str(data.get("suggestion") or ""),
+        "action": action,
+    }
+
+
+async def fix_consistency(
+    text: str,
+    issues: list,
+    summary: dict,
+    doc_path: str = "",
+) -> str:
+    """根据检查出的问题修正文本，只修矛盾不改风格。"""
+    memory = {}
+    if doc_path:
+        try:
+            memory = await memory_manager.get_memory(
+                doc_path, query=text, exclude_text=text, top_k=4, recent_chapters=3
+            )
+        except Exception:
+            logging.getLogger("summary_manager").exception("读取故事记忆失败")
+    messages = build_consistency_fix_prompt(text, issues or [], summary or {}, memory)
+    return await chat_completion(messages, temperature=0.5, max_tokens=4096)
 
 
 async def generate_outline(text: str, summary: dict, style_tags: list[str]) -> str:
